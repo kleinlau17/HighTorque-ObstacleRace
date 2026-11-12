@@ -1,0 +1,6 @@
+{
+  "numpy": "1.24.4",
+  "opencv": "4.10.0",
+  "opencv_wheel": "opencv-python-headless==4.10.0.84",
+  "python_minimum": "3.8"
+}

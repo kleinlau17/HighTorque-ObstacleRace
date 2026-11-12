@@ -82,6 +82,7 @@ class PublishedPlan:
     frame_time: object = None
     fresh: bool = False
     box_servo: object = None
+    recovery_direction: float = 0.
 
     def evaluate(self, stamp, imu, body_from_imu, cutoff):
         if self.box_servo is not None and stamp >= self.deadline:
@@ -128,23 +129,32 @@ def run(args, publish=False):
     archive = None
     guard_sub = None
     terminate = threading.Event()
+    navigating = threading.Event()
     if publish:
         from deploy.stop_archive import StopArchive
         from std_msgs.msg import String
         archive = StopArchive(out)
-        guard_sub = rospy.Subscriber('/competition/line_guard', String,
-            lambda msg:archive.guard(json.loads(msg.data)),queue_size=128)
+        def on_guard(msg):
+            data=json.loads(msg.data)
+            if runtime is not None:
+                runtime.crates.guard_publication(data.get('emitted_s',data['t']),data['source'])
+            archive.guard(data)
+        guard_sub = rospy.Subscriber('/competition/line_guard', String,on_guard,queue_size=128)
         def stop_signal(signum, frame):
             terminate.set()
         signal.signal(signal.SIGTERM, stop_signal)
         signal.signal(signal.SIGHUP, stop_signal)
-    def request(vector, reason='initializing', scene=None, frame_time=None, new_frame=False, box_deadline=None, box_hook=None):
+    def request(vector, reason='initializing', scene=None, frame_time=None, new_frame=False, box_deadline=None, box_hook=None, recovery_direction=0.):
         if publisher is not None:
             msg = TwistStamped()
             msg.header.frame_id = args.token
+            if navigating.is_set() and not terminate.is_set():
+                msg.header.frame_id += ('/active_left' if recovery_direction>0. else
+                                        '/active_right' if recovery_direction<0. else '/active')
             msg.header.stamp = rospy.Time.now()
             # Recheck after servo calculation, including the tick straddling a lease.
             if terminate.is_set():
+                msg.header.frame_id=args.token
                 vector, reason, new_frame = (0., 0., 0.), 'termination_requested', False
             elif box_deadline is not None and time.monotonic() >= box_deadline:
                 vector, reason, new_frame = (0., 0., 0.), 'box_observation_expired', False
@@ -184,7 +194,7 @@ def run(args, publish=False):
                 if plan is not publish_state:
                     continue
             request(vector, reason, plan.scene, plan.frame_time, fresh,
-                    plan.deadline if plan.box_servo is not None else None,plan.box_servo)
+                    plan.deadline if plan.box_servo is not None else None,plan.box_servo,plan.recovery_direction)
             next_tick += .02
             now = time.monotonic()
             if next_tick <= now:
@@ -342,8 +352,15 @@ def run(args, publish=False):
                 # The published hook owns this *same* command's plan parameters.
                 # Its only live inputs are the current AHRS and completed encoder samples.
                 freeze = getattr(runtime, 'freeze_publish_velocity', None)
+                box=runtime.crates
+                direction=box.recovery_direction() if box.frame is not None and not box.done else 0.
+                if not direction and runtime.steering_heading is not None:
+                    direction=np.sign(runtime.steering_heading)
                 publish_state = PublishedPlan(tuple(desired), runtime.deadline, pulse,
-                    reason, runtime.scene, frame_time, raw is not None, freeze() if freeze else None)
+                    reason, runtime.scene, frame_time, raw is not None, freeze() if freeze else None,
+                    direction)
+                if runtime.reason!='initializing':
+                    navigating.set()
                 if not publish:
                     request(desired)
                 if processing_ms is not None:
@@ -374,6 +391,7 @@ def run(args, publish=False):
     except (Exception, KeyboardInterrupt) as exc:
         status = 'error: '+str(exc)
     finally:
+        navigating.clear()
         sensors.leg_callback = None
         publish_stop.set()
         if publisher_thread is not None:

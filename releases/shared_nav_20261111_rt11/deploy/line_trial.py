@@ -18,6 +18,7 @@ def proxy_role(args):
     from deploy.line_follow_core import choose_command
     from deploy.head_profile import validate_body_only_amp
     from navigation.command import AMPCommandAdapter
+    from navigation.motion_deadline import MotionDeadline
     original_publisher=rospy.Publisher;guard=[]
 
     from deploy.stop_archive import GuardStops
@@ -29,6 +30,7 @@ def proxy_role(args):
             self.turn_start=None;self.turn_completed=False
             self.shared_adapter=AMPCommandAdapter() if args.shared_navigation else None
             self.calibration=json.loads(args.config.read_text()) if args.shared_navigation else None
+            self.motion_deadline=MotionDeadline()
             self.last_policy_receipt=None
             self.stops=GuardStops()
             self.stop_origin=None
@@ -50,10 +52,14 @@ def proxy_role(args):
         def publish(self,msg):
             with self.lock:self.cache['manual']=(time.monotonic(),msg)
         def on_nav(self,msg):
-            if msg._connection_header.get('callerid')!='/competition_lane_trial' or msg.header.frame_id!=args.token:return
+            if msg._connection_header.get('callerid')!='/competition_lane_trial':return
+            modes={args.token:None,args.token+'/active':0.,
+                   args.token+'/active_left':1.,args.token+'/active_right':-1.}
+            mode=msg.header.frame_id
+            if mode not in modes:return
             stamp=getattr(msg.header,'stamp',None)
             stamp_ns=stamp.to_nsec() if hasattr(stamp,'to_nsec') else None
-            with self.lock:self.cache['nav']=(time.monotonic(),msg.twist,stamp_ns)
+            with self.lock:self.cache['nav']=(time.monotonic(),msg.twist,stamp_ns,modes[mode])
         def stop(self):
             for _ in range(5):
                 try:self.real.publish(Twist())
@@ -91,9 +97,15 @@ def proxy_role(args):
                                 receipt,observed=policy_obs
                                 if receipt!=self.last_policy_receipt:
                                     feedback=list(observed.data[6:9]);self.last_policy_receipt=receipt
-                            command=self.shared_adapter.update(nv,feedback,True).tolist()
-                            source='navigation' if any(command) else 'stopped'
+                            raw=self.shared_adapter.update(nv,feedback,True)
+                            # A plain session token is startup, shutdown or a
+                            # legacy caller. Only active navigation may recover.
+                            direction=nav[3] if len(nav)>3 else None
+                            command=self.motion_deadline.output(now,raw,direction is not None,direction).tolist()
+                            source=('navigation_recovery' if self.motion_deadline.recovering else
+                                    'navigation' if any(command) else 'stopped')
                         else:
+                            self.motion_deadline.output(now,command,False)
                             stop_reason=('trial_duration' if elapsed>=args.duration
                                          else ('waiting_for_navigation' if nav is None else 'output_disabled'))
                     else:
@@ -116,6 +128,9 @@ def proxy_role(args):
                 out=Twist();out.linear.x,out.linear.y,out.angular.z=command
                 self.real.publish(out)
                 emitted=time.monotonic()
+                if args.shared_navigation:
+                    self.motion_deadline.published(emitted,command)
+                    if self.begun is None and any(command):self.begun=emitted
                 policy_obs=c.get('policy_obs')
                 policy_command=None if policy_obs is None else list(policy_obs[1].data[6:9])
                 policy_obs_age=None if policy_obs is None else now-policy_obs[0]
@@ -132,7 +147,7 @@ def proxy_role(args):
                 if stop_id!=previous_stop:
                     self.stop_origin = dict(stop_reason=stop_reason, reason=reason, source=source,
                                             navigation_stamp_ns=stamp_ns)
-                self.pub.publish(String(data=json.dumps(dict(t=now,stop_id=stop_id,stopped_at=stopped_at,
+                self.pub.publish(String(data=json.dumps(dict(t=now,emitted_s=emitted,stop_id=stop_id,stopped_at=stopped_at,
                     stop_reason=stop_reason,stop_origin=self.stop_origin,
                     navigation_stamp_ns=stamp_ns,allowed=allowed,reason=reason,source=source,command=command,elapsed=elapsed,distance_command_budget=self.budget,turn_command_budget=self.turn_budget,attitude=attitude_metrics,battery=battery_metrics,policy_command=policy_command,policy_obs_age_s=policy_obs_age,turn_pulse_completed=self.turn_completed))))
 

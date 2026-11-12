@@ -1,0 +1,339 @@
+diff --git a/deploy/shadow.py b/deploy/shadow.py
+index 3bce977e95df26eecd41670e101a0c1ca03adfad..28d74ff6f9d29f889478fd8f33ae3a821663f1e9 100644
+--- a/deploy/shadow.py
++++ b/deploy/shadow.py
+@@ -110,7 +110,7 @@ class Sensors:
+         return nearest, joints, head
+ 
+ 
+-def capture_worker(stream, width, height, latest, status=None):
++def capture_worker(stream, width, height, latest, status=None, on_frame=None):
+     def offer(value):
+         # Consumer may empty the queue between full() and get(); do not turn
+         # that ordinary race into a camera failure.
+@@ -137,6 +137,8 @@ def capture_worker(stream, width, height, latest, status=None):
+                 status['last_received'] = received
+                 status['last_frame_time'] = timestamp
+                 status['frames'] = status.get('frames', 0)+1
++            if on_frame is not None:
++                on_frame(frame)
+             offer(frame)
+     except Exception as exc:
+         if status is not None:
+diff --git a/deploy/shared_navigation.py b/deploy/shared_navigation.py
+index edcd058bf8e10dbe38e6a44cdc69b113429374f5..00427e4f8ed09bf0be5abf0f9481daae341d401e 100644
+--- a/deploy/shared_navigation.py
++++ b/deploy/shared_navigation.py
+@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
+ import cv2
+ import numpy as np
+ from navigation.calibration import calibration_reasons
++from navigation.pivot_depth import PivotDepth
+ from navigation.command import verify_device_files
+ from navigation.runtime import CameraFrame, LaneTurn, OnboardNavigation, core_hashes
+ from navigation.release import verify_release
+@@ -172,7 +173,9 @@ def run(args, publish=False):
+             if terminate.is_set():
+                 vector, reason, new_frame = (0., 0., 0.), 'termination_requested', False
+             elif box_deadline is not None and time.monotonic() >= box_deadline:
+-                vector, reason, new_frame = (0., 0., 0.), 'box_observation_expired', False
++                vector,new_frame=(0.,0.,0.),False
++                if reason!='depth_scan_unavailable':
++                    reason='box_observation_expired'
+             msg.twist.linear.x, msg.twist.linear.y, msg.twist.angular.z = map(float, vector)
+             if archive is not None:
+                 archive.decision(msg.header.stamp.to_nsec(), reason, scene, frame_time, new_frame)
+@@ -262,7 +265,24 @@ def run(args, publish=False):
+             # our own processing took, so a slow frame cannot fake a dead camera.
+             camera_status = {'frames': 0, 'last_received': time.monotonic(),
+                              'last_frame_time': None, 'error': None}
+-            threading.Thread(target=capture_worker, args=(proc.stdout, w, h, latest, camera_status), daemon=True).start()
++            pivot_depth=PivotDepth(runtime.local,maps)
++            def survey_pivot(raw):
++                crates=runtime.crates
++                if crates.done or crates.frame is None or not (crates.passage_wait or crates.entry_hold):
++                    runtime.pivot_capture=None
++                    return
++                # Use the exposure timestamp and measured head/IMU orientation.
++                # Failed surveys revoke the previous sample but leave the primary
++                # RGB-D feed running so the next exposure can recover.
++                try:
++                    capture_imu,_,capture_head=sensors.snapshot(raw.time)
++                    aligned=not frame_head_reasons(config,capture_head,raw.time)
++                    att=quaternion_matrix_xyzw(capture_imu[1])@body_from_imu.T
++                    clear=aligned and pivot_depth.clear(raw.depth,att,raw.time)
++                except Exception:
++                    clear=False
++                runtime.pivot_capture=(raw.time,clear)
++            threading.Thread(target=capture_worker, args=(proc.stdout,w,h,latest,camera_status,survey_pivot),daemon=True).start()
+             last_report = -1.
+             control_start = time.monotonic()
+             while time.monotonic()-control_start < args.duration and not rospy.is_shutdown() and not terminate.is_set():
+diff --git a/navigation/pivot_depth.py b/navigation/pivot_depth.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7c102b314666f0d17e8ad97f93f3dbea7a3c4e8
+--- /dev/null
++++ b/navigation/pivot_depth.py
+@@ -0,0 +1,75 @@
++"""Use incoming aligned depth to certify a short pivot while the crate planner is busy."""
++import math
++
++import cv2
++import numpy as np
++
++from navigation.ground import GroundEstimator
++
++
++class PivotDepth:
++    def __init__(self, camera, maps):
++        # One quarter of the planner pixels, with the same calibrated rectification.
++        self.maps=tuple(m[::2,::2].copy() for m in maps)
++        self.rays=camera.rays[::2,::2]@camera.rotation32.T
++        self.position=camera.position32
++        self.ground=GroundEstimator()
++
++    def clear(self, raw_depth, attitude, stamp):
++        depth=cv2.remap(raw_depth,*self.maps,cv2.INTER_NEAREST)
++        body=self.rays*depth[...,None]+self.position
++        level=body@np.asarray(attitude,dtype=np.float32).T
++        valid=np.isfinite(depth)&(depth>.15)&(depth<2.6)
++        ground=self.ground.estimate(level,valid&(body[...,0]>.30),timestamp=stamp)
++        if not ground.valid:
++            return False
++        height=ground.height(level)
++        x,y=body[...,0],body[...,1]
++        near=valid&(x>.20)&(x<.72)&(abs(height)<.032)
++        radius_sq=np.sum(level[...,:2]**2,axis=2)
++        rim=valid&(radius_sq<.35**2)&((height>.10)|(height<-.055))
++        return bool(not np.any(rim) and np.count_nonzero(near&(y>0.)&(y<.25))>=12
++                    and np.count_nonzero(near&(y<0.)&(y>-.25))>=12)
++
++
++class MeasuredScan:
++    """A single operator of yaw during an active depth-backed box search."""
++    def __init__(self):
++        self.key=None
++        self.index=0
++        self.start=None
++        self.target=None
++        self.last_tick=None
++        self.heading_at_start=None
++
++    def reset(self):
++        self.key=self.start=self.target=self.last_tick=None
++        self.index=0
++
++    def request(self,t,yaw,axis,key,direction):
++        if self.key!=key:
++            self.reset()
++            self.key=key
++        wrap=lambda a:math.atan2(math.sin(a),math.cos(a))
++        if self.last_tick is not None and t-self.last_tick>.32:
++            self.start=None
++        self.last_tick=t
++        if self.start is None:
++            self.start=t
++            self.heading_at_start=yaw
++        if self.target is not None and (abs(wrap(self.target-yaw))<.055 or t-self.start>=1.25):
++            self.target=None
++        if self.target is None:
++            for _ in range(2):
++                angle=(.26,-.27,.40,-.39)[self.index%4]
++                self.index+=1
++                self.target=axis+direction*angle
++                if abs(wrap(self.target-yaw))>.055:
++                    break
++            self.start=t
++            self.heading_at_start=yaw
++        error=wrap(self.target-yaw)
++        rate=min(.70,max(.45,2.6*abs(error)))
++        if t-self.start>.36 and abs(wrap(yaw-self.heading_at_start))<.035:
++            rate=.80
++        return (0.,0.,math.copysign(rate,error))
+diff --git a/navigation/runtime.py b/navigation/runtime.py
+index d520208dcce4ebe38b84df9fe0752fb206c9def7..f64217ec57255cfe507547d9ddcdab3f6a6f740b 100644
+--- a/navigation/runtime.py
++++ b/navigation/runtime.py
+@@ -12,6 +12,7 @@ import numpy as np
+ 
+ from navigation.box_servo import BoxServo
+ from navigation.box_motion_watch import BoxMotionWatch
++from navigation.pivot_depth import MeasuredScan
+ from navigation.command import AMPCommandAdapter
+ from navigation.environment import verify_dependencies
+ from navigation.floor_map import FloorMap
+@@ -370,6 +371,8 @@ class OnboardNavigation:
+         self.crates=BoxServo()
+         self._box_publication=None
+         self.motion_watch=BoxMotionWatch()
++        self.pivot_capture=None
++        self.measured_scan=MeasuredScan()
+         self.motion_survey=None
+         self.motion_status={}
+         self.tracked = NavigationRuntime(width, height, intrinsics, position, rotation, speed, observation_lease)
+@@ -457,6 +460,34 @@ class OnboardNavigation:
+                       and leg is not None and 0<=t-leg_stamp<.15 and np.linalg.norm(leg_velocity)>.065)
+         self.motion_status=dict(motion_still_s=round(feedback.still_s,3),motion_watch_reason=feedback.reason,
+                                 guarded_zero_s=None if zero_since is None else round(max(0.,t-zero_since),3))
++        quick=getattr(self,'pivot_capture',None)
++        scanner=getattr(self,'measured_scan',None)
++        searching=(in_boxes and (self.crates.passage_wait or self.crates.entry_hold)
++                   and self.crates.view_recovery.action in ('hold','scan'))
++        if not searching:
++            if scanner is not None and scanner.key is not None:
++                scanner.reset()
++        elif quick is not None and scanner is not None and np.linalg.norm(vector[:2])<1e-7:
++            # This permit only applies to yaw during a search. Recheck each
++            # 50 Hz tick against the live capture thread and the associated
++            # crate geometry. Never extend the preceding translation lease.
++            quick_stamp,quick_clear=quick
++            view=box.view
++            newest=self.crates.pending_frame
++            if newest is not None and newest.stamp>box.stamp:
++                view=newest.view
++            correct_target=(view is not None and view.index==self.crates.index+int(self.crates.phase=='shift'))
++            self.motion_status.update(pivot_capture_age_s=round(t-quick_stamp,3),pivot_depth_clear=quick_clear)
++            if (not quick_clear or not 0<=t-quick_stamp<=.30 or imu_stamp is None
++                    or not 0<=t-imu_stamp<=.15 or not correct_target or not view.turn_space
++                    or not 0<=t-view.stamp<=.80):
++                return (0.,0.,0.),'depth_scan_unavailable',t
++            rel=view.relative
++            side=view.side or self.crates.view_recovery.last_side
++            focus=(rel[1]+side*.23) if rel is not None else side
++            cmd=scanner.request(t,yaw,box.heading,(view.index,view.identity),1 if focus>=0 else -1)
++            self.motion_status.update(pivot_target_rad=scanner.target,pivot_request_rad_s=cmd[2])
++            return cmd,'box_live_depth_scan',min(quick_stamp+.30,imu_stamp+.15,view.stamp+.80)
+         if feedback.yaw_request and not lane_walking and clear and 0<=t-pivot_stamp<=.38:
+             self.motion_status['motion_pivot_rad_s']=float(feedback.yaw_request)
+             return (0.,0.,float(feedback.yaw_request)),'motion_reobserve',min(pivot_stamp+.38,imu_stamp+.15)
+diff --git a/release_manifest.json b/release_manifest.json
+index 4ccd61b32f9219bdf2166a14f2bfe355a20f0d46..62bb18b8ba96c4610b48ff3218ec0ca62e2905a0 100644
+--- a/release_manifest.json
++++ b/release_manifest.json
+@@ -1,5 +1,5 @@
+ {
+-  "release_id": "shared_nav_20261112_rt13_active",
++  "release_id": "shared_nav_20261112_rt13_depth_scan",
+   "python": ">=3.8",
+   "navigation_core_sha256": {
+     "__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+@@ -19,8 +19,9 @@
+     "ground.py": "b8b68500422a6a150c4b129172bf427ab39590d12cc4c9918c7095aeb655e81e",
+     "leg_odometry.py": "02ef5eae50b97b2a00cafc35df2d5cf4bcadb757bd93116ff9361fedc66ce24d",
+     "motion_recovery.py": "fa27ad9e49b8debd593b6ddc6a323210bf320d443f8397a92a940cccf0a83891",
++    "pivot_depth.py": "f7ede437a81e3fbbffb2962261eaee30303f3ed454ce68aaaa5ec9e7e38518c1",
+     "release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+-    "runtime.py": "08e7d24194b70af5e1187e713cee56f816839faa87584870ed69e4cd27175a10",
++    "runtime.py": "cae8511def15a9d8c8e349390998e0ce059ae06dd395928c664680f1f23c80fc",
+     "surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+     "visual.py": "c748867e01a33197f42f8718adbe5d17849b1b24df05ac805627cbaf4e34a90e"
+   },
+@@ -85,8 +86,8 @@
+     "deploy/reset_camera.cpp": "63abaa0853ecdcfe4658c9da51f79df63d95049aa7b3d5a6370cab8d84c18808",
+     "deploy/run_navigation_buttons.sh": "8327022110a897d02ad6364c6be352cbbf94d0624ef2300f3a98fb58faae5b64",
+     "deploy/run_shadow.sh": "cf3ae734c5a44d2e6f6560f9db682f5d19a0ed63c0416c86976492019b4f6fd9",
+-    "deploy/shadow.py": "e4dd5d1ee718cded07baa9f5fc62a7244fc1a5f94a8046ab14e2b1585e05e58b",
+-    "deploy/shared_navigation.py": "edcb168d35ba6e18a56fddf681b40e59e1b53f5fdd3a9de5fcf524214b9bd4fd",
++    "deploy/shadow.py": "cdcf31893f9208ef60ce1cbcf3c8996cb93d8a1b75f85a8edaf6d81fa4d84c3d",
++    "deploy/shared_navigation.py": "c414928c602230a9d9fdb5d2c4c9161e4341695ddd65caafc40a7dac7950ef78",
+     "deploy/stop_archive.py": "90c83f7f0798a891194d3fc1a9aaa5515be71f75f11ec7c33e598ab44392f04b",
+     "deploy/task_head_pose.json": "fe2f430b11a1bed540fb046415886082213fe231342ebd05f62a6910c44bbc6f",
+     "navigation/__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+@@ -106,8 +107,9 @@
+     "navigation/ground.py": "b8b68500422a6a150c4b129172bf427ab39590d12cc4c9918c7095aeb655e81e",
+     "navigation/leg_odometry.py": "02ef5eae50b97b2a00cafc35df2d5cf4bcadb757bd93116ff9361fedc66ce24d",
+     "navigation/motion_recovery.py": "fa27ad9e49b8debd593b6ddc6a323210bf320d443f8397a92a940cccf0a83891",
++    "navigation/pivot_depth.py": "f7ede437a81e3fbbffb2962261eaee30303f3ed454ce68aaaa5ec9e7e38518c1",
+     "navigation/release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+-    "navigation/runtime.py": "08e7d24194b70af5e1187e713cee56f816839faa87584870ed69e4cd27175a10",
++    "navigation/runtime.py": "cae8511def15a9d8c8e349390998e0ce059ae06dd395928c664680f1f23c80fc",
+     "navigation/surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+     "navigation/visual.py": "c748867e01a33197f42f8718adbe5d17849b1b24df05ac805627cbaf4e34a90e",
+     "reference/robot/PiPlusPro_SF_12L8A0G2H0W_Z_261010/urdf/PiPlusPro_SF_12L8A0G2H0W_Z_261010.urdf": "5169fe5d59eae117c006232b7512a0e28347383187482c05619487f19831a69c",
+@@ -133,6 +135,7 @@
+     "scripts/test_rt13_active_drive.py": "fda052d0604a6560c76c3d242e7403d682fdb78d2b8f1269ed1a5bd5b8c08616",
+     "scripts/test_rt13_active_handoff.py": "f0659ca49c943ef6085c8eed69cc338621f8456a064d10f3e1a3d5338dc04e75",
+     "scripts/test_rt13_entry_recovery.py": "5c676f1b7d545efe839bb6e2afeb3636e0a4950011422f8391f1d467d42155da",
++    "scripts/test_rt13_live_depth.py": "50a1689b2bbc50e657887b94d3944e131b628a778ca1c07397065345df448c5c",
+     "scripts/test_rt13_motion_watch.py": "00316151571c9da56d143c2024a6b4d32b76ef102bd504c3936bad7b2c37b17a",
+     "scripts/test_rt13_passage.py": "5abf6ceba3343b842843d754a7a0b76fd24416e4a64e05e4085e440aa159e41d",
+     "scripts/test_rt13_view_recovery.py": "967327c3d7aefe0aae156895592ecb13b5d03b357cd71a24381f0cde9ce5bdc7",
+@@ -151,7 +154,7 @@
+   "default_mode": "shadow_without_motor_publishers",
+   "real_motion_requires": "verified camera/IMU calibration, current sensors, immutable AMP identity, sole guarded publisher",
+   "nostop_policy": "Mission duration inherited from rt10; local manoeuvres may request zero velocity.",
+-  "parent_release_id": "shared_nav_20261112_rt13_passage_recovery",
+-  "parent_manifest_sha256": "83f0bd8fc02d06224c8689cbe89c58a21de61f0b87d1718835d0583230716aa9",
++  "parent_release_id": "shared_nav_20261112_rt13_active",
++  "parent_manifest_sha256": "cc05e689492b35e418f06fe5bd58b67aabbbf0aca63f14914d1a3f2f8f752daa",
+   "validation_scope": "Onboard RGB-D and IMU control, targeted software regressions and recorded hardware captures. Current publication logic was checked with unit tests, without a new simulation or a physical course run."
+ }
+diff --git a/scripts/test_rt13_live_depth.py b/scripts/test_rt13_live_depth.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..719cefa6e069aaa1f3e04edd07402b71b344c50f
+--- /dev/null
++++ b/scripts/test_rt13_live_depth.py
+@@ -0,0 +1,63 @@
++"""Check the 50 Hz path at measured Jetson processing delays, without running a robot."""
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++import sys
++import numpy as np
++
++sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
++from deploy.shared_navigation import PublishedPlan, TurnCutoff, supervised_request
++from navigation.box_view_recovery import View
++from navigation.box_servo import BoxServo
++from navigation.box_motion_watch import BoxMotionWatch
++from navigation.pivot_depth import MeasuredScan
++from navigation.runtime import OnboardNavigation
++
++
++class DepthScanTests(unittest.TestCase):
++    def setUp(self):
++        self.nav=OnboardNavigation.__new__(OnboardNavigation)
++        self.nav.crates=BoxServo()
++        self.nav.crates.passage_wait=True
++        self.nav.crates.view_recovery.action='scan'
++        self.nav.initial_yaw=0.
++        self.nav.snapshot_time=None
++        self.nav.motion_watch=BoxMotionWatch()
++        self.nav.measured_scan=MeasuredScan()
++        self.cutoff=TurnCutoff()
++        self.plan=PublishedPlan((0.,.28,0.),deadline=1.,reason='box_enter',
++                                box_servo=lambda *a:np.array([0.,.28,0.]))
++
++    def update(self,t,stamp,clear=True,imu=True,geometry=True):
++        frame_stamp=t-.42
++        self.nav.crates.frame=SimpleNamespace(heading=0.,stamp=frame_stamp,
++            view=View(frame_stamp,0,(.43,.35),-1,geometry,None,identity=8))
++        self.nav.motion_survey=(frame_stamp,geometry,False,0.)
++        self.nav.pivot_capture=(stamp,clear)
++        imu=(t,[0,0,0,1]) if imu else None
++        return supervised_request(self.plan,t,imu,np.eye(3),self.cutoff,self.nav,None)
++
++    def test_late_crate_processing_preserves_coherent_yaw_but_no_translation(self):
++        turns=[]
++        for tick in range(53):
++            t=2.+.02*tick
++            vec,reason,_,end=self.update(t,2.+int(tick*.02*6)/6.)
++            self.assertEqual(reason,'box_live_depth_scan')
++            self.assertGreater(end,t)
++            self.assertEqual(tuple(vec[:2]),(0.,0.))
++            turns.append(vec[2])
++        self.assertTrue(all(w>0. for w in turns))
++        self.assertGreater(max(turns),.7)
++
++    def test_fresh_block_or_stale_sensors_or_stale_geometry_revoke(self):
++        for args in [(2.,1.6),(2.,2.,False),(2.,2.,True,False),(2.,2.,True,True,False)]:
++            vec,_,_,_=self.update(*args)
++            self.assertFalse(any(vec))
++        self.nav.crates.passage_wait=False
++        vec,_,_,_=self.update(2.,2.)
++        self.assertFalse(any(vec))
++
++    def test_conflicting_newer_crate_frame_vetoes_immediately(self):
++        self.nav.crates.pending_frame=SimpleNamespace(stamp=1.99,view=View(1.99,0,(.2,.2),0,False,None))
++        vec,_,_,_=self.update(2.,2.)
++        self.assertFalse(any(vec))

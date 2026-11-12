@@ -1,0 +1,83 @@
+<!doctype html><html><head><meta charset="utf-8"><title>RT16 live 3D</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#070b10;color:#dbe6ee;font:13px/1.5 ui-monospace,Menlo,monospace}
+#hud{position:fixed;left:14px;top:10px;padding:10px 14px;background:rgba(10,16,22,.85);border:1px solid #1e2a36;border-radius:8px;pointer-events:none}
+#pic{position:fixed;right:14px;top:12px;width:320px;border:1px solid #1e2a36;border-radius:8px;image-rendering:auto}
+canvas{display:block;cursor:grab}canvas:active{cursor:grabbing}</style></head><body>
+<div id="hud">connecting…</div><img id="pic" src="live.jpg"><canvas id="c"></canvas>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),hud=document.getElementById('hud');
+let yaw=-0.9,pitch=0.6,zoom=1,drag=null;
+let SCENE={white:[],raised:[],boxes:[],floor:-0.35,timing:{},scene:'-',basis:'-'};
+const ROBOT={cx:-0.20,cy:0,l:0.40,w:0.60,h:0.70};
+let lo=[1e9,1e9,1e9],hi=[-1e9,-1e9,-1e9],ctr=[0,0,0],rad=1;
+function resize(){cv.width=innerWidth;cv.height=innerHeight;}addEventListener('resize',resize);resize();
+cv.addEventListener('mousedown',e=>drag=[e.clientX,e.clientY]);
+addEventListener('mouseup',()=>drag=null);
+addEventListener('mousemove',e=>{if(!drag)return;yaw+=(e.clientX-drag[0])*0.008;pitch=Math.max(-1.35,Math.min(1.35,pitch+(e.clientY-drag[1])*0.008));drag=[e.clientX,e.clientY];});
+cv.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(0.2,Math.min(8,zoom*(e.deltaY<0?1.12:0.89)));},{passive:false});
+function bounds(){
+  lo=[1e9,1e9,1e9];hi=[-1e9,-1e9,-1e9];
+  for(const arr of [SCENE.white,SCENE.raised])for(const p of arr)for(let i=0;i<3;i++){if(p[i]<lo[i])lo[i]=p[i];if(p[i]>hi[i])hi[i]=p[i];}
+  for(const b of (SCENE.boxes||[])){for(let i=0;i<2;i++){lo[i]=Math.min(lo[i],b.center[i]-.2);hi[i]=Math.max(hi[i],b.center[i]+.2);}}
+  if(lo[0]>hi[0]){lo=[-.5,-.5,-.4];hi=[1.2,1.2,.3];}
+  ctr=[(lo[0]+hi[0])/2,(lo[1]+hi[1])/2,(lo[2]+hi[2])/2];
+  rad=Math.max(hi[0]-lo[0],hi[1]-lo[1],hi[2]-lo[2],0.8)*0.55;
+}
+function rot(p){const q=[p[0]-ctr[0],p[1]-ctr[1],p[2]-ctr[2]];
+ const cy=Math.cos(yaw),sy=Math.sin(yaw);let x=q[0]*cy-q[1]*sy,y=q[0]*sy+q[1]*cy,z=q[2];
+ const cp=Math.cos(pitch),sp=Math.sin(pitch);return [x,y*cp-z*sp,y*sp+z*cp];}
+function proj(p,s,cx,cy0){const r=rot(p);return [cx+r[0]*s,cy0-r[1]*s,r[2]];}
+function draw(){
+  const w=innerWidth,h=innerHeight;ctx.clearRect(0,0,w,h);
+  const cx=w*0.5,cy0=h*0.56,s=Math.min(w,h)*0.80*zoom/(2*rad);
+  const zf=SCENE.floor;
+  ctx.strokeStyle='#16222d';ctx.lineWidth=1;
+  for(let g=-1.5;g<=1.5001;g+=0.25){
+    let a=proj([ctr[0]+g,ctr[1]-1.5,zf],s,cx,cy0),b=proj([ctr[0]+g,ctr[1]+1.5,zf],s,cx,cy0);
+    ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();
+    let c=proj([ctr[0]-1.5,ctr[1]+g,zf],s,cx,cy0),dd=proj([ctr[0]+1.5,ctr[1]+g,zf],s,cx,cy0);
+    ctx.beginPath();ctx.moveTo(c[0],c[1]);ctx.lineTo(dd[0],dd[1]);ctx.stroke();
+  }
+  const all=SCENE.white.concat(SCENE.raised);
+  all.sort((a,b)=>rot(a)[2]-rot(b)[2]);
+  for(const p of all){
+    const q=proj(p,s,cx,cy0);
+    if(q[0]<-20||q[0]>w+20||q[1]<-20||q[1]>h+20)continue;
+    ctx.fillStyle='rgb('+(p[3]|0)+','+(p[4]|0)+','+(p[5]|0)+')';
+    ctx.fillRect(q[0]-1.2,q[1]-1.2,2.4,2.4);
+  }
+  for(const B of (SCENE.boxes||[])){
+    const [bx,by]=B.center,[sx,sy,sz]=B.size,th=B.yaw,zf2=B.floor;
+    const cs=Math.cos(th),sn=Math.sin(th);
+    const corner=(dx,dy)=>[bx+dx*cs-dy*sn,by+dx*sn+dy*cs];
+    const base=[[-sx/2,-sy/2],[sx/2,-sy/2],[sx/2,sy/2],[-sx/2,sy/2]].map(([x,y])=>corner(x,y));
+    const bot=base.map(([x,y])=>[x,y,zf2]),top=base.map(([x,y])=>[x,y,zf2+sz]);
+    ctx.strokeStyle='#ff9f1c';ctx.lineWidth=2.2;
+    for(const poly of [bot,top]){ctx.beginPath();poly.forEach((q,j)=>{const p=proj(q,s,cx,cy0);j?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);});ctx.closePath();ctx.stroke();}
+    for(let j=0;j<4;j++){const a=proj(bot[j],s,cx,cy0),b=proj(top[j],s,cx,cy0);ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();}
+  }
+  const c=[[-ROBOT.l/2,-ROBOT.w/2],[ROBOT.l/2,-ROBOT.w/2],[ROBOT.l/2,ROBOT.w/2],[-ROBOT.l/2,ROBOT.w/2]].map(([x,y])=>[ROBOT.cx+x,ROBOT.cy+y]);
+  const bot=c.map(([x,y])=>[x,y,zf]),top=c.map(([x,y])=>[x,y,zf+ROBOT.h]);
+  ctx.strokeStyle='#33e0ff';ctx.lineWidth=1.6;ctx.setLineDash([5,4]);
+  for(const poly of [bot,top]){ctx.beginPath();poly.forEach((q,j)=>{const p=proj(q,s,cx,cy0);j?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);});ctx.closePath();ctx.stroke();}
+  ctx.setLineDash([]);
+  const o=proj([0,0,0],s,cx,cy0);
+  ctx.fillStyle='#33e0ff';ctx.beginPath();ctx.moveTo(o[0],o[1]-8);ctx.lineTo(o[0]-6,o[1]+6);ctx.lineTo(o[0]+6,o[1]+6);ctx.closePath();ctx.fill();
+  requestAnimationFrame(draw);
+}
+async function poll(){
+  try{
+    const r=await fetch('scene.json?ts='+Date.now(),{cache:'no-store'});
+    const j=await r.json();
+    if(j&&j.white){SCENE=j;bounds();}
+    const t=SCENE.timing||{};
+    hud.innerHTML='<b>RT16 live</b> · '+SCENE.scene+' / '+SCENE.basis+'<br>'+
+      'tape '+SCENE.white.length+' · obstacle '+SCENE.raised.length+' · boxes '+(SCENE.boxes||[]).length+'<br>'+
+      'lane '+(t.lane_ms?t.lane_ms.toFixed(1):'-')+' ms · avoid '+(t.avoid_ms?t.avoid_ms.toFixed(1):'-')+
+      ' ms · box '+(t.box_ms?t.box_ms.toFixed(1):'-')+' ms<br><span style="color:#8fa6b8">drag rotate · wheel zoom</span>';
+    const pic=document.getElementById('pic'); if(pic) pic.src='live.jpg?ts='+Date.now();
+  }catch(e){hud.textContent='waiting for scene.json…';}
+  setTimeout(poll,350);
+}
+bounds();draw();poll();
+</script></body></html>

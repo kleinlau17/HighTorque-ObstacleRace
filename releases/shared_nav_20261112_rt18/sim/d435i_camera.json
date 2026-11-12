@@ -1,0 +1,13 @@
+{
+  "name": "d435i_20261110",
+  "source": "output/deployment/calibration_20261110/runs/ground_calibration_03/camera_intrinsics.json",
+  "width": 640,
+  "height": 480,
+  "fx": 604.179,
+  "fy": 603.821,
+  "cx": 325.629,
+  "cy": 245.226,
+  "fps": 15,
+  "processing_scale": 0.5,
+  "note": "RGB and color-aligned depth intrinsics. Pro mount and standby ground-plane fit are recorded in pro_camera_mount.json."
+}

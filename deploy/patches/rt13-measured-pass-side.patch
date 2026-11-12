@@ -1,0 +1,693 @@
+diff --git a/navigation/box_body.py b/navigation/box_body.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f34e4927ae463b60016047c532f159828249bea5
+--- /dev/null
++++ b/navigation/box_body.py
+@@ -0,0 +1,51 @@
++"""Extremities of the calibrated Pro, in AHRS axes relative to the trunk."""
++import numpy as np
++
++from navigation.leg_odometry import _feet, _rotation, LEG_JOINTS
++
++
++def limb_points(joints,attitude):
++    """Sphere centers and radii for toes, heels, arm and wrist capsules."""
++    try:
++        feet,_=_feet(np.array([joints[name] for name in LEG_JOINTS]),attitude)
++        samples=[feet.reshape(-1,3)]
++        radii=[np.full(feet.size//3,.010)]
++        for side,sign in [('l',1.),('r',-1.)]:
++            origin=np.zeros(3)
++            orientation=attitude
++            for name,axis,offset in [('shoulder_pitch',1,[0.,sign*.1084,.117]),
++                                     ('shoulder_roll',0,[0.,sign*.038,0.]),
++                                     ('upper_arm',2,[0.,0.,-.0724]),
++                                     ('elbow',1,[0.,0.,-.038])]:
++                origin=origin+orientation@offset
++                orientation=orientation@_rotation(axis,joints[f'{side}_{name}_joint'])
++            # Elbow sphere, forearm capsule ends and the distal wrist sphere.
++            samples.append(np.array([origin-distance*orientation[:,2]
++                                     for distance in (.050,.054,.104,.126)]))
++            radii.append(np.array([.0298,.020,.020,.0298]))
++    except (KeyError,ValueError):
++        return None
++    return np.column_stack([np.vstack(samples),np.concatenate(radii)])
++
++
++def station_window(body,basis,position,target_y,back,front):
++    """Limit a cross-lane step using the foot and arm pose read this tick."""
++    points=body[:,:2]@basis
++    margin=.009
++    radii=body[:,3]+margin
++    # Allow for up to one short lateral step and residual gait travel.
++    lookahead=np.clip(target_y-position[1],-.055,.055)
++    low_y=position[1]+points[:,1]+min(0.,lookahead)
++    high_y=position[1]+points[:,1]+max(0.,lookahead)
++    low,high=-np.inf,np.inf
++    for obstacle,behind in [(back,True),(front,False)]:
++        dy=np.maximum(0.,np.maximum(obstacle[1]-.10-high_y,low_y-obstacle[1]-.10))
++        near=dy<radii
++        if not np.any(near):
++            continue
++        extension=np.sqrt(radii[near]**2-dy[near]**2)
++        if behind:
++            low=np.max(obstacle[0]+.10-points[near,0]+extension)
++        else:
++            high=np.min(obstacle[0]-.10-points[near,0]-extension)
++    return low,high
+diff --git a/navigation/box_passage.py b/navigation/box_passage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..518be603b343286194ab1e26565d4d92a3add75b
+--- /dev/null
++++ b/navigation/box_passage.py
+@@ -0,0 +1,166 @@
++"""Select a passing side for each observed crate using metric tape and floor measurements."""
++from dataclasses import dataclass
++import cv2
++import numpy as np
++
++from navigation.gap_controller import GapController
++
++
++@dataclass(frozen=True)
++class Edge:
++    # y = slope*x + offset in the horizontal crate-heading frame, relative to the trunk.
++    offset: float
++    slope: float
++    near: float
++    far: float
++
++    def at(self, x):
++        return self.offset + self.slope*x
++
++
++def _floor_tape(rgb, ground):
++    bright, dark = rgb.max(axis=2), rgb.min(axis=2)
++    neutral = (dark>115) & (bright-dark<.16*bright)
++    # On the field the white tape can look pale blue against the green mat.
++    # Require darker turf on BOTH sides of a tinted stripe in the same row.
++    r, g, b = cv2.split(rgb)
++    tinted = ground & ~neutral & (dark>115) & (b==bright) & (r>=.73*g) & (dark>=.57*bright)
++    if not tinted.any():
++        return ground & neutral
++    turf = ground & (r<.73*g) & (g>=.72*b)
++    turf_green = np.where(turf, g, np.uint8(255))
++    # At the working resolution a strip is a few pixels wide. A wide patch
++    # or a carpet-to-box boundary lacks a close turf sample on one side.
++    width = max(3, round(rgb.shape[1]*.04))
++    window = np.ones((1,width),np.uint8)
++    left = cv2.erode(turf_green,window,anchor=(width-1,0),borderType=cv2.BORDER_CONSTANT,borderValue=255)
++    right = cv2.erode(turf_green,window,anchor=(0,0),borderType=cv2.BORDER_CONSTANT,borderValue=255)
++    contrast = g.astype(np.int16)-np.maximum(left,right)
++    return ground & (neutral | (tinted & (contrast>=32)))
++
++
++def floor_edges(rgb, points, height, valid):
++    x, y = points[..., 0], points[..., 1]
++    ground = valid & (abs(height)<.024) & (x>.22) & (x<1.47) & (abs(y)<.85)
++    paint = _floor_tape(rgb,ground)
++    if np.count_nonzero(paint)<12:
++        return []
++    # Only join near-neighbour pixels; extrapolate a measured near straight, never a far bend.
++    blobs = cv2.morphologyEx(paint.astype('uint8'), cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
++    count, labels, stats, _ = cv2.connectedComponentsWithStats(blobs)
++    edges = []
++    for k in range(1,count):
++        if stats[k,cv2.CC_STAT_AREA]<12:
++            continue
++        sample = points[paint & (labels==k),:2]
++        if len(sample)<12:
++            continue
++        near = np.percentile(sample[:,0],5)
++        sample = sample[(sample[:,0]>=near)&(sample[:,0]<=near+.38)]
++        if near>1.17 or len(sample)<12 or np.ptp(sample[:,0])<(.22 if near>.87 else .065):
++            continue
++        short=np.ptp(sample[:,0])<.17
++        bins = np.floor((sample[:,0]-near)/(.014 if short else .035)).astype(int)
++        sections = [np.median(sample[bins==j],axis=0) for j in np.unique(bins)
++                    if np.count_nonzero(bins==j)>=2]
++        if len(sections)<(4 if short else 5):
++            continue
++        xs, ys = np.asarray(sections).T
++        if np.ptp(xs)<(.055 if short else .135) or np.max(np.diff(xs))>(.031 if short else .084):
++            continue
++        slope, intercept = np.polyfit(xs,ys,1)
++        residual = abs(sample[:,1]-slope*sample[:,0]-intercept)
++        if abs(slope)>.78 or np.percentile(residual,85)>(.013 if short else .016):
++            continue
++        edges.append(Edge(float(intercept),float(slope),float(xs[0]),float(xs[-1])))
++    return edges
++
++
++# The existing Pro gait leaves .285 m from the trunk to the box-side wrist.
++# Track paint is a foot-support boundary (the outer arm may overhang paint).
++BOX_HALF = .10
++LIMB_MARGIN = .010
++# The shipped path puts the trunk up to 2 cm over the stripe on this course.
++# One foot must still have supported ground on the inside of that stripe.
++TRUNK_OVER_PAINT = .020
++MIN_OPEN_WIDTH = GapController.side_reach + LIMB_MARGIN - TRUNK_OVER_PAINT
++
++
++def measure_passages(edges, points, heights, center, previous_offset=0.):
++    """Right/left measured gap widths and usable target offsets, in metres."""
++    cx, cy = center
++    widths = [None, None]
++    offsets = [None, None]
++    blocked = [False, False]
++    x = points[:,0]-cx
++    for side_index, sign in enumerate((-1, 1)):
++        distances = []
++        for edge in edges:
++            if cx < edge.near-.35 or cx > edge.far+.65 or abs(edge.slope)>.35:
++                continue
++            # Measure at both ends of the box. Take the narrower clearance.
++            bound = min(sign*(edge.at(x)-cy) for x in (cx-BOX_HALF,cx+BOX_HALF))
++            if 0 < bound <= .55:
++                distances.append(bound-BOX_HALF)
++        # A new solid return can invalidate a measured passage even when
++        # the tape disappears. Never authorize one using an old width alone.
++        y = sign*(points[:,1]-cy)-BOX_HALF
++        arm_limit = abs(previous_offset) if sign*previous_offset>0 else .42
++        swept = ((abs(x)<.16)&(y>.012)&(y<arm_limit-BOX_HALF+GapController.side_reach)
++                 &(heights>.10)&(heights<.65))
++        blocked[side_index] = np.count_nonzero(swept)>=5
++        if not distances:
++            continue
++        width = max(0., min(distances))
++        widths[side_index] = width
++        if width < MIN_OPEN_WIDTH or blocked[side_index]:
++            blocked[side_index] = True
++            continue
++        # Confirm an area of measured floor across the gap, including the
++        # entrance and the box itself. Missing/invalid depth cannot count.
++        gap = (x>=-.22)&(x<=.10)&(y>.012)&(y<width)
++        floor = gap & (abs(heights)<.032)
++        samples = np.histogram2d(x[floor],y[floor],
++            bins=([-.22,-.10,.10],np.linspace(.012,width,4)))[0]
++        if not np.all(samples>=3):
++            continue
++        # Keep the established .42 m centerline for a nominal 30 cm gap,
++        # allowing 5 mm stripe-fit uncertainty. Tuck inward for a narrower gap.
++        offsets[side_index] = .42 if width>=.295 else BOX_HALF+width+TRUNK_OVER_PAINT
++    return tuple(widths), tuple(offsets), tuple(blocked)
++
++
++@dataclass
++class PassageChoice:
++    offset: float = 0.
++    widths: tuple = (None, None)
++    vote_side: int = 0
++    vote_time: float = -np.inf
++    seen_at: float = -np.inf
++
++    def observe(self, stamp, edges, xy, heights, center, max_age, lane_offset=None):
++        if stamp<=self.seen_at:
++            return
++        self.seen_at = stamp
++        self.widths, offsets, blocked = measure_passages(edges, xy, heights, center, self.offset)
++        if self.offset and not blocked[int(self.offset>0)]:
++            return
++        self.offset = 0.
++        available = [i for i in (0,1) if offsets[i] is not None]
++        if not available:
++            self.vote_side = 0
++            return
++        best = max(available, key=lambda i:self.widths[i])
++        sign = 1 if best else -1
++        # Two boundaries enclosing the 50 cm track independently identify a
++        # boxed-in side. Otherwise require agreement across separate captures.
++        other = self.widths[1-best]
++        paired = (other is not None and blocked[1-best]
++                  and abs(self.widths[best]+other+2*BOX_HALF-.50)<.035)
++        # A model of the lane fitted to current paint may also identify one
++        # stripe; it cannot create an opening without the depth-supported gap.
++        lane_confirmed = (lane_offset is not None and
++                          abs(sign*lane_offset-(self.widths[best]+BOX_HALF-.25))<.045)
++        if paired or lane_confirmed or (self.vote_side==sign and stamp-self.vote_time<=max_age):
++            self.offset = sign*offsets[best]
++        self.vote_side, self.vote_time = sign, stamp
+diff --git a/navigation/box_servo.py b/navigation/box_servo.py
+index 3492fc568189147fca757b6f5371d90583474f0c..44619c8bd99c8e9a48ba1a9e05dbabd7171045de 100644
+--- a/navigation/box_servo.py
++++ b/navigation/box_servo.py
+@@ -2,6 +2,8 @@
+ from dataclasses import dataclass
+ from threading import Lock
+ 
++from navigation.box_body import limb_points, station_window
++from navigation.box_passage import PassageChoice, floor_edges
+ from navigation.leg_odometry import ProLegOdometry
+ import cv2
+ import numpy as np
+@@ -70,6 +72,13 @@ class BoxFrame:
+     corroborated_stamp: float = float('-inf')
+     previous_first_seen: float = float('-inf')
+     neighbor_range: object = None
++    passages: tuple = ()
++    passage_seen: tuple = ()
++
++    def pass_offset(self, index):
++        if self.passages:
++            return self.passages[index] if index < len(self.passages) else 0.
++        return self.side*.42 if index==0 else 0.
+ 
+ 
+ class BoxServo:
+@@ -77,6 +86,7 @@ class BoxServo:
+         self.control_lock=Lock()
+         self.leg_lock=Lock()
+         self.latest_leg=None
++        self.limb_sample=None
+         self.frame=None
+         self.pending_frame=None
+         self.heading=None
+@@ -87,6 +97,9 @@ class BoxServo:
+         self.phase='enter'
+         self.along_started=None
+         self.side=0
++        self.passages=[]
++        self.shift_admitted=-1
++        self.passage_wait=False
+         self.legs=ProLegOdometry()
+         self.leg_anchor=None
+         self.last_time=None
+@@ -267,6 +280,7 @@ class BoxServo:
+             if self.boxes and min(np.linalg.norm(b-p) for b in self.boxes)<.23:continue
+             if self.boxes and p[0]<self.boxes[0][0]-.26 and self.index==0 and self.phase in ('enter','along'):
+                 self.boxes.insert(0,p);associations.append((p,rel));self.side=0
++                self.passages.insert(0,PassageChoice())
+                 self.visible=[0]+[index+1 for index in self.visible]
+                 self.first_seen_streak=0
+                 continue
+@@ -316,12 +330,27 @@ class BoxServo:
+                 corroborated=np.mean(measurements,axis=0)
+         if self.track_mid is None and len(self.boxes)>1:
+             self.track_mid=(self.boxes[0][1]+self.boxes[1][1])/2
+-        if not self.side or (self.index==0 and self.phase in ('enter','along')):
+-            if len(self.boxes)>1:
+-                self.side=np.sign(self.boxes[1][1]-self.boxes[0][1])
+-            elif lane is not None:
+-                p=(self.boxes[0]-self.pos)@basis.T@rot(yaw)
+-                self.side=np.sign(np.polyval(lane,p[0])-p[1])
++        while len(self.passages)<len(self.boxes):
++            self.passages.append(PassageChoice())
++        if plane.valid and associations:
++            edges=floor_edges(frame.rgb,depth_points,height,np.isfinite(frame.depth))
++            valid=np.isfinite(height) & (frame.depth>.15) & (frame.depth<2.6)
++            xy=depth_points[valid,:2]
++            heights=height[valid]
++            for index,box in enumerate(self.boxes):
++                matches=[rel for known,rel in associations if known is box]
++                if not matches or index<self.index:
++                    continue
++                rel=min(matches,key=lambda v: np.linalg.norm(self.pos+v-box))
++                lane_offset=None
++                if lane is not None:
++                    to_body=basis.T@rot(yaw)
++                    body_rel=rel@to_body
++                    midpoint=np.array([body_rel[0],np.polyval(lane,body_rel[0])])@to_body.T
++                    lane_offset=midpoint[1]-rel[1]
++                self.passages[index].observe(frame.time,edges,xy,heights,rel,FIRST_BOX_LEASE_S,lane_offset)
++        offsets=tuple(p.offset for p in self.passages)
++        self.side=float(np.sign(offsets[0]))
+         if dt:
+             v=(self.pos-old)/dt
+             self.velocity=.56*self.velocity+.44*np.clip(v,-.50,.50)
+@@ -337,7 +366,7 @@ class BoxServo:
+         self.pending_frame=BoxFrame(self.pos.copy(),self.velocity.copy(),tuple(self.boxes),self.heading,
+                             self.side,self.last_time,self.leg_anchor,self.kick_until,
+                             self.first_seen,self.first_relative,self.first_seen_streak,corroborated,frame.time,self.previous_first_seen,
+-                            float(inferred[0][0]) if inferred else None)
++                            float(inferred[0][0]) if inferred else None,offsets,tuple(p.seen_at for p in self.passages))
+ 
+     def commit_frame(self):
+         if self.pending_frame is not None:
+@@ -349,6 +378,9 @@ class BoxServo:
+             accepted=self.legs.update(t,positions,attitude)
+             if accepted:
+                 self.latest_leg=(t,self.legs.xy.copy(),self.legs.velocity.copy())
++                body=limb_points(positions,attitude)
++                if body is not None:
++                    self.limb_sample=(t,body)
+             return accepted
+ 
+     def command(self,t,yaw):
+@@ -362,7 +394,7 @@ class BoxServo:
+         # A missed match immediately returns to the ordinary pursuit lease.
+         measured=frame.first_relative
+         if (frame.first_seen_streak and measured is not None
+-                and 0.32<measured[0]<.75 and abs(measured[1]+frame.side*.42)<.055):
++                and 0.32<measured[0]<.75 and abs(measured[1]+frame.pass_offset(0))<.055):
+             return .74
+         return FIRST_BOX_LEASE_S
+ 
+@@ -375,8 +407,11 @@ class BoxServo:
+         """Bind the box measurements and their expiry to this published plan."""
+         entry_plan=self.phase=='enter'
+         epoch=self.entry_epoch
++        target_index=self.index+int(self.phase=='shift')
+         deadline=self.observation_deadline(frame,deadline)
+         def velocity(stamp,planned,attitude):
++            if self.frame is not None and self.frame.pass_offset(target_index)!=frame.pass_offset(target_index):
++                return np.zeros(3)
+             if stamp>=deadline or (entry_plan and epoch!=self.entry_epoch):
+                 return np.zeros(3)
+             if entry_plan and stamp-frame.first_seen>=FIRST_BOX_LEASE_S and np.linalg.norm(planned[:2])>.085:
+@@ -387,6 +422,8 @@ class BoxServo:
+                 # A planning thread may already have advanced to its next
+                 # observation. Never advance that plan using this older frame.
+                 if self.frame is not frame:
++                    if self.frame is None or self.frame.pass_offset(target_index)!=frame.pass_offset(target_index):
++                        return np.zeros(3)
+                     return np.zeros(3) if entry_plan and (self.entry_hold or epoch!=self.entry_epoch) else planned
+                 yaw=np.arctan2(attitude[1,0],attitude[0,0])
+                 guided=self._command(stamp,yaw,frame)
+@@ -400,7 +437,7 @@ class BoxServo:
+         # A latched stop requires new camera evidence. Elapsed time never rearms it.
+         age=t-frame.first_seen
+         fresh=0<=age<FIRST_BOX_LEASE_S or (0<=age<self.entry_evidence_lease(frame) and abs(lateral)<.055)
+-        visual_error=(frame.first_relative[1]+frame.side*.42
++        visual_error=(frame.first_relative[1]+frame.pass_offset(0)
+                       if frame.first_relative is not None else None)
+         conflicting=(fresh and frame.first_seen_streak and visual_error is not None
+                      and abs(visual_error-lateral)>.11)
+@@ -458,9 +495,9 @@ class BoxServo:
+         self.restart_witness=(t,pos[0],measured_range)
+ 
+     def _command(self,t,yaw,frame):
+-        if self.entry_hold and frame is not None and (not frame.centers or not frame.side):
++        if self.entry_hold and frame is not None and not frame.centers:
+             return np.zeros(3)
+-        if frame is None or not frame.centers or not frame.side or self.done or self.index>=len(frame.centers):return None
++        if frame is None or not frame.centers or self.done or self.index>=len(frame.centers):return None
+         i=self.index
+         center=frame.centers[i]
+         leg=self.latest_leg
+@@ -471,8 +508,25 @@ class BoxServo:
+             pos=frame.position+(leg[1]-frame.leg_anchor)@basis+vel*(t-leg[0])
+         else:
+             pos=frame.position+frame.velocity*min(.30,max(0.,t-frame.stamp))
+-        side=frame.side*(-1 if i%2 else 1)
+-        y=center[1]+side*.42
++        offset=frame.pass_offset(i)
++        next_offset=frame.pass_offset(i+1)
++        self.passage_wait=self.phase not in ('lane_entry','shift') and not offset
++        if self.phase=='shift':
++            # Re-identify this specific crate before acting on its surveyed gap.
++            if not next_offset:
++                self.shift_admitted=-1
++            elif i+1<len(frame.passage_seen) and 0<=t-frame.passage_seen[i+1]<FIRST_BOX_LEASE_S:
++                self.shift_admitted=i+1
++            self.passage_wait=not offset or self.shift_admitted!=i+1
++        if self.passage_wait:
++            self.last_cmd=np.zeros(3)
++            if (self.phase=='enter' and frame.first_relative is not None
++                    and 0<=t-frame.first_seen<FIRST_BOX_LEASE_S and frame.first_relative[0]>.55):
++                angle=wrap(frame.heading-yaw)
++                if abs(angle)>.08:
++                    self.last_cmd[2]=np.clip(2.4*angle,-.50,.50)
++            return self.last_cmd.copy()
++        y=center[1]+offset
+         if i+1<len(frame.centers):
+             gate=(center[0]+frame.centers[i+1][0])/2-.029
+         else:
+@@ -485,13 +539,27 @@ class BoxServo:
+             target_x=gate+.04
+             y=.5*(frame.centers[-2][1]+frame.centers[-1][1])
+         else:
+-            y=frame.centers[i+1][1]-side*.42
++            y=frame.centers[i+1][1]+next_offset
+             # As the torso moves across the lane, the trailing outside foot
+             # approaches the previous crate. Advance through the midpoint
+             # gradually after the leading arm has crossed the next crate.
+-            total=abs(y-(center[1]+side*.42))
+-            fraction=np.clip(1.-abs(y-pos[1])/total,0.,1.)
++            total=abs(y-(center[1]+offset))
++            fraction=np.clip(1.-abs(y-pos[1])/max(total,.001),0.,1.)
+             target_x=gate+.063*np.clip((fraction-.15)/.58,0.,1.)
++            # During a change of sides the two box faces constrain fore/aft
++            # movement. Account for the current swing foot and protruding wrist.
++            sample=self.limb_sample
++            if sample is not None and 0<=t-sample[0]<=.13:
++                low,high=station_window(sample[1],rot(frame.heading),pos,y,center,frame.centers[i+1])
++                if low>high:
++                    self.passage_wait=True
++                    self.last_cmd=np.zeros(3)
++                    return self.last_cmd.copy()
++                margin=.015
++                if low+margin<=high-margin:
++                    target_x=np.clip(target_x,low+margin,high-margin)
++                elif np.isfinite(low+high):
++                    target_x=(low+high)*.5
+         dx=target_x-pos[0];lateral=y-pos[1]
+         vx0,vy0=vel
+         ahead=dx-.55*vx0
+@@ -515,8 +583,8 @@ class BoxServo:
+             last=frame.first_relative
+             if (self.entry_hold=='first_crate_lost' and pair is not None and last is not None
+                     and 0<=t-frame.corroborated_stamp<=FIRST_BOX_LEASE_S and 0<=t-frame.first_seen<=2.5
+-                    and .24<last[0]<.80 and abs(last[1]+side*.42)<.12
+-                    and abs(pair[0]-.36)<.10 and abs(pair[1]+side*.42)<.06
++                    and .24<last[0]<.80 and abs(last[1]+offset)<.12
++                    and abs(pair[0]-.36)<.10 and abs(pair[1]+offset)<.06
+                     and abs(lateral)<.035 and abs(dx)<.065 and abs(vy0)<.10):
+                 self.phase='along'
+                 self.along_started=t
+@@ -562,6 +630,7 @@ class BoxServo:
+ 
+     def diagnostic(self):
+         return dict(crate_phase=self.phase,crate_index=self.index,crate_side=float(self.side),
++                    crate_passage_gaps=[p.widths for p in self.passages],crate_passage_offsets=[p.offset for p in self.passages],crate_passage_wait=self.passage_wait,
+                     crate_entry_hold=self.entry_hold,crate_refined_third=self.refined_third,crate_restart_used=self.restart_used,crate_restart_until=self.restart_until if self.restart_used else None,crate_first_match_time=None if self.first_relative is None else self.first_seen,
+                     crate_first_relative=None if self.frame is None or self.frame.first_relative is None else self.frame.first_relative.tolist(),
+                     crate_neighbors=self.neighbor_estimates,
+diff --git a/navigation/runtime.py b/navigation/runtime.py
+index e261e7b876652f2a232070eff31d20d64787dc36..762ca713c59266119573b102cfa6140fce99bf06 100644
+--- a/navigation/runtime.py
++++ b/navigation/runtime.py
+@@ -648,7 +648,8 @@ class OnboardNavigation:
+             self._box_publication=self.crates.publication(frame,self.deadline)
+             self.desired=guided
+             self.lane_turn.pause(timestamp)
+-            self.reason='box_entry_hold' if self.crates.entry_hold else 'box_'+self.crates.phase
++            self.reason=('box_passage_unconfirmed' if self.crates.passage_wait else
++                         'box_entry_hold' if self.crates.entry_hold else 'box_'+self.crates.phase)
+             return self.adapter.update(self.desired,enabled=True)
+         if (enabled and self.reason not in ('stale_imu', 'stale_camera', 'unusable_rgb') and
+                 not self.tracking_control and self.edge_correction is not None and
+diff --git a/release_manifest.json b/release_manifest.json
+index b11ef420501a1a3322a30f1d80b433cc99daf4ce..2824418b49272d1aaae18def48011e63c3e99e25 100644
+--- a/release_manifest.json
++++ b/release_manifest.json
+@@ -1,10 +1,12 @@
+ {
+-  "release_id": "shared_nav_20261112_rt13_10cm",
++  "release_id": "shared_nav_20261112_rt13_passage",
+   "python": ">=3.8",
+   "navigation_core_sha256": {
+     "__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+     "amp_contract.json": "d128ef7d1c039901d80ccc6d522d83cada396970b9ee4612ff330d4c38aac76b",
+-    "box_servo.py": "5a6dc9e021febb8a310ac76f5e901cca5ea2d0f86fc93b8c35d6f32075606cc2",
++    "box_body.py": "f78e0c9bfb39355d48bf8af33c776dab70b45e7e98cb5378d3d127212fb61ffa",
++    "box_passage.py": "4ec25f0737a2a530d281c70759625639f5bd700751b7af9f9629962ca112d5d2",
++    "box_servo.py": "ef62f30db6a30999bf9585a1de5c2d35db7a98bc7f8f90ea32a9f8c79774737c",
+     "calibration.py": "42f46aded85643151027eadd3b6cbf1a8d53c446fd473787180d0bf57f072f48",
+     "command.py": "f9704718503c19da9a95d6d6052325db6bd68593858151d609bdcb5a2b79f734",
+     "dependencies.json": "ab15eb730632c982638ec9c26863037d8720b5df22eb7590d6434342750fd599",
+@@ -16,7 +18,7 @@
+     "leg_odometry.py": "02ef5eae50b97b2a00cafc35df2d5cf4bcadb757bd93116ff9361fedc66ce24d",
+     "motion_recovery.py": "fa27ad9e49b8debd593b6ddc6a323210bf320d443f8397a92a940cccf0a83891",
+     "release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+-    "runtime.py": "ec984e621b250676ab3f999fbc78c41d1ce08d785e42bcd3ba77000c50238d6b",
++    "runtime.py": "81bf968cb36d118b908f0e1a4419c0d799ea0be0e8f925fc9a98877a29dbb209",
+     "surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+     "visual.py": "a2e961fd26980c3de89aa5095a5815cb15153ec2693b56142036429c1d3c246e"
+   },
+@@ -87,7 +89,9 @@
+     "deploy/task_head_pose.json": "fe2f430b11a1bed540fb046415886082213fe231342ebd05f62a6910c44bbc6f",
+     "navigation/__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+     "navigation/amp_contract.json": "d128ef7d1c039901d80ccc6d522d83cada396970b9ee4612ff330d4c38aac76b",
+-    "navigation/box_servo.py": "5a6dc9e021febb8a310ac76f5e901cca5ea2d0f86fc93b8c35d6f32075606cc2",
++    "navigation/box_body.py": "f78e0c9bfb39355d48bf8af33c776dab70b45e7e98cb5378d3d127212fb61ffa",
++    "navigation/box_passage.py": "4ec25f0737a2a530d281c70759625639f5bd700751b7af9f9629962ca112d5d2",
++    "navigation/box_servo.py": "ef62f30db6a30999bf9585a1de5c2d35db7a98bc7f8f90ea32a9f8c79774737c",
+     "navigation/calibration.py": "42f46aded85643151027eadd3b6cbf1a8d53c446fd473787180d0bf57f072f48",
+     "navigation/command.py": "f9704718503c19da9a95d6d6052325db6bd68593858151d609bdcb5a2b79f734",
+     "navigation/dependencies.json": "ab15eb730632c982638ec9c26863037d8720b5df22eb7590d6434342750fd599",
+@@ -99,7 +103,7 @@
+     "navigation/leg_odometry.py": "02ef5eae50b97b2a00cafc35df2d5cf4bcadb757bd93116ff9361fedc66ce24d",
+     "navigation/motion_recovery.py": "fa27ad9e49b8debd593b6ddc6a323210bf320d443f8397a92a940cccf0a83891",
+     "navigation/release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+-    "navigation/runtime.py": "ec984e621b250676ab3f999fbc78c41d1ce08d785e42bcd3ba77000c50238d6b",
++    "navigation/runtime.py": "81bf968cb36d118b908f0e1a4419c0d799ea0be0e8f925fc9a98877a29dbb209",
+     "navigation/surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+     "navigation/visual.py": "a2e961fd26980c3de89aa5095a5815cb15153ec2693b56142036429c1d3c246e",
+     "reference/robot/PiPlusPro_SF_12L8A0G2H0W_Z_261010/urdf/PiPlusPro_SF_12L8A0G2H0W_Z_261010.urdf": "5169fe5d59eae117c006232b7512a0e28347383187482c05619487f19831a69c",
+@@ -120,9 +124,10 @@
+     "scripts/test_navigation_buttons.py": "4d768fe7a413598c2d703553725f0205b8f3d00a826843324e65b42c606c28e0",
+     "scripts/test_navigation_cli.py": "a4870ebb8c66094d02dd97d603ffc8658c3d832f7f4923ae98676470d6f4a1fd",
+     "scripts/test_rgbd_odometry.py": "00114e9e00e95a09cf0e83109a72dc793b8b1ea38152acb9dc6320f766e3201f",
+-    "scripts/test_rt11_box_publication.py": "ce746e9b73a8514963303ecd52ba713520f3b188303f363b05b493389ad087ef",
+-    "scripts/test_rt11_box_visibility.py": "1ae79c0f001aa17c86841cb6a1183967440ce404f8d90b81dc0731674db3c705",
++    "scripts/test_rt11_box_publication.py": "e90f620c0681fd43e8fdfcd8fbb34f971ad7199cbf2590fe85a3351893a20b12",
++    "scripts/test_rt11_box_visibility.py": "8e6056336d0b0faec6392750626cba0e08594ec32a184af3c45690b0801f32ac",
+     "scripts/test_rt13_entry_recovery.py": "5c676f1b7d545efe839bb6e2afeb3636e0a4950011422f8391f1d467d42155da",
++    "scripts/test_rt13_passage.py": "af8f557e1786b2f733be1c8f6d1f1e6cd99ba93f0922415c72d19d76d7fbe09c",
+     "scripts/test_sensor_recovery.py": "1405a42934f58e841d0cbe4dfc48e162519bf3f31b9357b801211bc3dd5e022f",
+     "scripts/test_shared_navigation.py": "d92209f27b25d35d5987292a8d8606db5b28eeeafef237a8f252793589901444",
+     "scripts/test_single_boundary.py": "ad15b9263030f9115a2d5a212aa64f706c535daa56bc5f7765b5b5a7ead00214",
+@@ -138,7 +143,7 @@
+   "default_mode": "shadow_without_motor_publishers",
+   "real_motion_requires": "verified camera/IMU calibration, current sensors, immutable AMP identity, sole guarded publisher",
+   "nostop_policy": "Mission duration inherited from rt10; local manoeuvres may request zero velocity.",
+-  "parent_release_id": "shared_nav_20261111_rt13",
+-  "parent_manifest_sha256": "147a09000875fcbe5991ca9949faa183cba83d591821077c493a332bc43a6679",
+-  "validation_scope": "Local RGB-D height-boundary, perception and RT13 entry recovery unit tests."
++  "parent_release_id": "shared_nav_20261112_rt13_10cm",
++  "parent_manifest_sha256": "1541b1e2df6a61206e09379ecd91d5dcea8d91acd736013fb89415bb9933a08b",
++  "validation_scope": "Local RGB-D selection tests and closed-loop MuJoCo. Hardware motion has not been tested for this candidate."
+ }
+diff --git a/scripts/test_rt11_box_publication.py b/scripts/test_rt11_box_publication.py
+index 5952acfb03221b136e2d5be1074133f2ddb39f88..c01dde64ba2a496a45dfc0e71cd20accdba7fb6b 100644
+--- a/scripts/test_rt11_box_publication.py
++++ b/scripts/test_rt11_box_publication.py
+@@ -35,7 +35,7 @@ class BoxPublicationTest(unittest.TestCase):
+         self.nav.commit_frame()
+         self.nav.target = None
+         stale, *_ = self.evaluate(self.plan, .2, self.imu)
+-        np.testing.assert_equal(stale, self.vector)
++        np.testing.assert_equal(stale, np.zeros(3))  # The new capture contradicts the old direction.
+         self.assertIsNone(self.nav.target)
+         new_plan = replace(self.plan, box_servo=self.nav.publication(next_frame, 1.))
+         new, *_ = self.evaluate(new_plan, .2, self.imu)
+@@ -83,7 +83,8 @@ class BoxPublicationTest(unittest.TestCase):
+             second=origin+4.097
+             nav.phase='shift'
+             nav.frame=replace(frame,centers=(frame.centers[0],np.array([1.,.12])),
+-                              position=np.array([.68,-.30]),stamp=second)
++                              position=np.array([.68,-.30]),stamp=second,
++                              passages=(.42,-.42),passage_seen=(origin,second))
+             nav.command(second,0.)
+             self.assertEqual((nav.phase,nav.index),('along',1))
+             nav.frame=replace(nav.frame, position=np.array([1.31,-.30]))
+diff --git a/scripts/test_rt11_box_visibility.py b/scripts/test_rt11_box_visibility.py
+index b7f399c98bccb55c89ba07100197dec925138123..b3277757c0d557ace215fe0cd5a84134bc56816e 100644
+--- a/scripts/test_rt11_box_visibility.py
++++ b/scripts/test_rt11_box_visibility.py
+@@ -10,6 +10,7 @@ import numpy as np
+ 
+ SOURCE=Path(__file__).resolve().parents[1]
+ sys.path.insert(0,str(SOURCE))
++from navigation.box_passage import PassageChoice
+ from navigation.box_servo import BoxFrame, BoxServo
+ from navigation.leg_odometry import LEG_JOINTS
+ from navigation.runtime import CameraFrame
+@@ -29,6 +30,7 @@ class VisibilityTest(unittest.TestCase):
+         self.nav.heading=0.
+         self.nav.boxes=[np.array(v) for v in [(1.,-.12),(1.55,.12),(2.10,-.12)]]
+         self.nav.side=1.
++        self.nav.passages=[PassageChoice(offset=v) for v in (.42,-.42,.42)]
+ 
+     def observe(self,stamp,depth):
+         frame=CameraFrame(stamp,self.rgb,depth)
+diff --git a/scripts/test_rt13_passage.py b/scripts/test_rt13_passage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3127e4f22425de0af62c4b37d26a6d3b1f4ab72
+--- /dev/null
++++ b/scripts/test_rt13_passage.py
+@@ -0,0 +1,94 @@
++"""Passing decisions through the shipping perception, command and publication paths."""
++from dataclasses import replace
++from pathlib import Path
++import sys
++from types import SimpleNamespace
++import unittest
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from navigation.box_passage import Edge, PassageChoice
++from navigation.box_servo import BoxServo, BoxFrame, FIRST_BOX_LEASE_S
++from test_ground_color_integration import CAMERA_POSITION, CAMERA_ROTATION, camera_perception, perspective_scene
++
++
++class PassageTests(unittest.TestCase):
++    def see(self, box_y, hide=None):
++        frame, labels = perspective_scene([[25,130,50]], box_centers=[(.87,box_y)])
++        camera = camera_perception()
++        if hide == 'tape':
++            rgb = frame.rgb.copy()
++            rgb[np.min(rgb, axis=2)>150] = [19,125,78]
++            frame = replace(frame, rgb=rgb)
++        if hide == 'floor':
++            xy = (camera.rays*frame.depth[...,None])@CAMERA_ROTATION.T+CAMERA_POSITION
++            depth = frame.depth.copy()
++            depth[(labels==-1)&(abs(xy[...,0]-.87)<.23)&(abs(xy[...,1])<.23)] = np.nan
++            frame = replace(frame, depth=depth)
++        servo = BoxServo()
++        tracker = SimpleNamespace(xy=np.zeros(2),odometry=SimpleNamespace(accepted=False))
++        for t in (1.,1.15):
++            capture = replace(frame,time=t)
++            observation, _ = camera.inspect_lane(capture, np.eye(3))
++            servo.observe(capture,np.eye(3),camera,tracker,0.,observation.lane)
++            servo.commit_frame()
++        self.assertIn(0,servo.visible)
++        return servo, servo.command(1.16,0.)
++
++    def test_rgbd_mirror_selects_wider_floor(self):
++        for y,side in ((-.15,1),(.15,-1)):
++            with self.subTest(y=y):
++                servo,command = self.see(y)
++                self.assertEqual(servo.side,side)
++                self.assertGreater(command[1]*side,.1)
++                self.assertAlmostEqual(servo.passages[0].widths[int(side>0)],.30,delta=.01)
++
++    def test_narrow_or_unseen_passages_hold_translation(self):
++        for y,hidden in ((0.,None),(.15,'tape'),(.15,'floor')):
++            with self.subTest(y=y,hidden=hidden):
++                servo,command=self.see(y,hidden)
++                self.assertEqual(servo.side,0)
++                self.assertTrue(servo.passage_wait)
++                np.testing.assert_array_equal(command[:2],0.)
++
++    def test_single_edge_needs_two_captures_and_obstruction_revokes_choice(self):
++        choice=PassageChoice()
++        edges=[Edge(.40,0.,.45,.95)]
++        x,y=np.meshgrid(np.linspace(.67,.98,30),np.linspace(.115,.395,30))
++        floor=np.column_stack((x.ravel(),y.ravel()))
++        h=np.zeros(len(floor))
++        for stamp in (1.,1.):
++            choice.observe(stamp,edges,floor,h,(.88,0.),FIRST_BOX_LEASE_S)
++            self.assertEqual(choice.offset,0.)
++        choice.observe(1.2,edges,floor,h,(.88,0.),FIRST_BOX_LEASE_S)
++        self.assertGreater(choice.offset,0.)
++        blocked=h.copy()
++        blocked[(floor[:,0]>.81)&(floor[:,1]>.16)]=.14
++        choice.observe(1.4,[],floor,blocked,(.88,0.),FIRST_BOX_LEASE_S)
++        self.assertEqual(choice.offset,0.)
++
++    def test_crossing_holds_when_current_limbs_cannot_fit_between_faces(self):
++        servo=BoxServo()
++        servo.phase='shift'
++        servo.frame=BoxFrame(np.array([.50,0.]),np.zeros(2),(np.array([.40,-.02]),np.array([.60,.02])),
++                             0.,1.,2.,None,0.,passages=(.42,-.42),passage_seen=(2.,2.))
++        servo.limb_sample=(2.,np.array([[-.10,0.,0.,.02],[.10,0.,0.,.02]]))
++        np.testing.assert_array_equal(servo.command(2.,0.),0.)
++        self.assertTrue(servo.passage_wait)
++
++    def test_second_crate_uses_its_own_side_and_requires_current_match(self):
++        servo=BoxServo()
++        servo.phase='shift'
++        frame=BoxFrame(np.zeros(2),np.zeros(2),(np.array([.4,.02]),np.array([.90,.01])),
++                       0.,1.,2.,None,0.,passages=(.42,.42),passage_seen=(1.,1.))
++        servo.frame=frame
++        np.testing.assert_array_equal(servo.command(2.,0.),0.)
++        servo.frame=replace(frame,passage_seen=(1.,2.))
++        self.assertGreater(servo.command(2.,0.)[1],0.)
++        servo.frame=replace(frame,passages=(.42,0.))
++        np.testing.assert_array_equal(servo.command(2.,0.),0.)
++
++
++if __name__=='__main__':
++    unittest.main()

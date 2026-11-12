@@ -1,0 +1,606 @@
+diff --git a/deploy/NOSTOP.md b/deploy/NOSTOP.md
+index 2cab65d5b2b8e0da1f3c82ccdd158b0d35dc41ac..98557f18ad073d13e8f6bbcf666596b630d190e1 100644
+--- a/deploy/NOSTOP.md
++++ b/deploy/NOSTOP.md
+@@ -1,4 +1,10 @@
+-# RT11 三箱导航
++# RT13 第一箱丢失后的停车与恢复
++
++进入第一箱期间，首箱直接匹配通常在 0.55 秒后到期。接近目标且最后一帧仍直接确认已横向对齐时，低于或等于 0.085 m/s 的平移制动请求最多可沿用至 0.74 秒。观测到期、视觉与位移估计明显冲突，或横向误差持续没有缩小时，规划进入 `box_entry_hold` 并下发零速。发布线程也检查同一个观测截止时间。
++
++机器人保持原有箱序。两帧新的首箱观测与当前横向估计一致后可重新接近。若首箱已在身侧，后面两箱的独立测量可以确认入口目标已经到达，切换为沿箱前进。停车后若步态未重新起步，只有在箱距与机身运动都显示前进停滞时，才允许一次短时转向起步。入口恢复后，连续同帧观测到第二、第三箱时，可用两箱的相对横距复核第三箱的初始位置。通过三箱后交回原有巡线。
++
++## RT11 三箱导航记录
+ 
+ 箱区控制从 RGB-D 的箱面和顶缘估计箱体方向与相对位置，用足底运动学和 IMU 在视觉帧之间修正前进、横移和制动指令。每个发布周期使用已完成的一帧和与之配对的控制目标。箱区观察超时或 IMU 失效会请求零速。
+ 
+diff --git a/navigation/box_servo.py b/navigation/box_servo.py
+index b7f5d5fbf63d68410634fe619c4bc0c329ac2a61..3492fc568189147fca757b6f5371d90583474f0c 100644
+--- a/navigation/box_servo.py
++++ b/navigation/box_servo.py
+@@ -7,6 +7,9 @@ import cv2
+ import numpy as np
+ 
+ 
++FIRST_BOX_LEASE_S = .55
++
++
+ def rot(a):
+     return np.array([[np.cos(a),-np.sin(a)],[np.sin(a),np.cos(a)]])
+ 
+@@ -60,6 +63,13 @@ class BoxFrame:
+     stamp: float
+     leg_anchor: object
+     kick_until: float
++    first_seen: float = float('-inf')
++    first_relative: object = None
++    first_seen_streak: int = 0
++    corroborated_relative: object = None
++    corroborated_stamp: float = float('-inf')
++    previous_first_seen: float = float('-inf')
++    neighbor_range: object = None
+ 
+ 
+ class BoxServo:
+@@ -90,6 +100,26 @@ class BoxServo:
+         self.corrections=[]
+         self.travel=0.
+         self.stationary=0.
++        self.first_seen=float('-inf')
++        self.first_relative=None
++        self.first_seen_streak=0
++        self.previous_first_seen=float('-inf')
++        self.neighbor_estimates=[]
++        self.third_pair_samples=[]
++        self.refined_third=False
++        self.entry_hold=None
++        self.entry_epoch=0
++        self.recovered_entry=False
++        self.restart_witness=None
++        self.restart_until=float('-inf')
++        self.restart_used=False
++        self.restart_origin=None
++        self.restart_direction=None
++        self.restart_phase=None
++        self.hold_since=None
++        self.hold_error=None
++        self.progress_stamp=None
++        self.progress_error=None
+         self.kick_until=0.
+ 
+     def observe(self, frame, attitude, camera, tracked, origin_yaw, lane):
+@@ -230,15 +260,60 @@ class BoxServo:
+                         line_err.append(np.median(pick[:,1]-v))
+             if line_err:self.pos[1]-=.55*np.clip(np.median(line_err),-.018,.018)
+         self.visible=[]
++        associations=[(self.boxes[i],rel) for i,rel,_ in hits]
+         for i,rel,_ in hits:self.visible.append(i)
+         for rel in sorted(new,key=lambda p:p[0]):
+             p=self.pos+rel
+             if self.boxes and min(np.linalg.norm(b-p) for b in self.boxes)<.23:continue
+             if self.boxes and p[0]<self.boxes[0][0]-.26 and self.index==0 and self.phase in ('enter','along'):
+-                self.boxes.insert(0,p);self.side=0;continue
++                self.boxes.insert(0,p);associations.append((p,rel));self.side=0
++                self.visible=[0]+[index+1 for index in self.visible]
++                self.first_seen_streak=0
++                continue
+             if self.boxes and p[0]<self.boxes[-1][0]+.26:continue
+-            self.boxes.append(p);self.visible.append(len(self.boxes)-1)
++            self.boxes.append(p);associations.append((p,rel));self.visible.append(len(self.boxes)-1)
+         if not self.boxes:self.heading=None;return
++        first_matches=[rel for box,rel in associations if box is self.boxes[0]]
++        if first_matches:
++            self.previous_first_seen=self.first_seen if self.first_seen_streak else float('-inf')
++            self.first_relative=min(first_matches,key=lambda rel: np.linalg.norm(rel+self.pos-self.boxes[0])).copy()
++            self.first_seen_streak=(self.first_seen_streak+1 if 0 < frame.time-self.first_seen <= FIRST_BOX_LEASE_S else 1)
++            self.first_seen=frame.time
++        else:
++            self.first_seen_streak=0
++        # From beside crate 0 it can leave the lens while both forward crates
++        # remain visible. Two distinct landmarks must independently agree on
++        # the current relative position. They can certify entry completion only.
++        inferred=[]
++        for later in self.boxes[1:]:
++            matches=[rel for box,rel in associations if box is later]
++            if matches:
++                rel=min(matches,key=lambda v: np.linalg.norm(v+self.pos-later))
++                inferred.append(rel+self.boxes[0]-later)
++        if (self.recovered_entry and not self.refined_third and self.index==0
++                and self.phase in ('along','shift') and len(self.boxes)==3 and len(inferred)==2):
++            # Re-observe lateral spacing of crates 1 and 2 simultaneously.
++            # Their difference cancels the robot position and any common odometry drift.
++            discrepancy=float(inferred[1][1]-inferred[0][1])
++            self.third_pair_samples=[(t,e) for t,e in self.third_pair_samples if frame.time-t<1.2]
++            self.third_pair_samples.append((frame.time,discrepancy))
++            values=[e for t,e in self.third_pair_samples]
++            if (self.phase=='shift' and len(values)>=4 and frame.time-self.third_pair_samples[0][0]>.5
++                    and np.ptp(values)<.013 and .035<abs(np.median(values))<.10):
++                corrected=self.boxes[2].copy()
++                corrected[1]+=float(np.median(values))
++                self.boxes[2]=corrected
++                self.refined_third=True
++        self.neighbor_estimates=[v.tolist() for v in inferred]
++        corroborated=None
++        if len(inferred)>=2:
++            measurements=np.asarray(inferred)
++            spread=np.ptp(measurements,axis=0)
++            # A clipped lateral side can bias one inferred centre by half a
++            # box width. Both estimates must put the body on the passing side.
++            side_distances=-self.side*measurements[:,1]
++            if spread[0]<.065 and spread[1]<=.10 and np.all((.355<side_distances)&(side_distances<.54)):
++                corroborated=np.mean(measurements,axis=0)
+         if self.track_mid is None and len(self.boxes)>1:
+             self.track_mid=(self.boxes[0][1]+self.boxes[1][1])/2
+         if not self.side or (self.index==0 and self.phase in ('enter','along')):
+@@ -260,7 +335,9 @@ class BoxServo:
+         # a complete capture result by one reference assignment; its arrays
+         # are independent of the mutable next-frame tracker.
+         self.pending_frame=BoxFrame(self.pos.copy(),self.velocity.copy(),tuple(self.boxes),self.heading,
+-                            self.side,self.last_time,self.leg_anchor,self.kick_until)
++                            self.side,self.last_time,self.leg_anchor,self.kick_until,
++                            self.first_seen,self.first_relative,self.first_seen_streak,corroborated,frame.time,self.previous_first_seen,
++                            float(inferred[0][0]) if inferred else None)
+ 
+     def commit_frame(self):
+         if self.pending_frame is not None:
+@@ -278,18 +355,39 @@ class BoxServo:
+         with self.control_lock:
+             return self._command(t,yaw,self.frame)
+ 
++    @staticmethod
++    def entry_evidence_lease(frame):
++        # In the final deceleration, a processed capture can arrive late even
++        # though every RGB-D exposure still directly measures the same crate.
++        # A missed match immediately returns to the ordinary pursuit lease.
++        measured=frame.first_relative
++        if (frame.first_seen_streak and measured is not None
++                and 0.32<measured[0]<.75 and abs(measured[1]+frame.side*.42)<.055):
++            return .74
++        return FIRST_BOX_LEASE_S
++
++    def observation_deadline(self,frame,deadline):
++        if self.phase=='enter' and frame is not None:
++            return min(deadline,frame.first_seen+self.entry_evidence_lease(frame))
++        return deadline
++
+     def publication(self,frame,deadline):
+         """Bind the box measurements and their expiry to this published plan."""
++        entry_plan=self.phase=='enter'
++        epoch=self.entry_epoch
++        deadline=self.observation_deadline(frame,deadline)
+         def velocity(stamp,planned,attitude):
+-            if stamp>=deadline:
++            if stamp>=deadline or (entry_plan and epoch!=self.entry_epoch):
++                return np.zeros(3)
++            if entry_plan and stamp-frame.first_seen>=FIRST_BOX_LEASE_S and np.linalg.norm(planned[:2])>.085:
+                 return np.zeros(3)
+             if not self.control_lock.acquire(blocking=False):
+-                return planned
++                return np.zeros(3) if entry_plan and (self.entry_hold or epoch!=self.entry_epoch) else planned
+             try:
+                 # A planning thread may already have advanced to its next
+                 # observation. Never advance that plan using this older frame.
+                 if self.frame is not frame:
+-                    return planned
++                    return np.zeros(3) if entry_plan and (self.entry_hold or epoch!=self.entry_epoch) else planned
+                 yaw=np.arctan2(attitude[1,0],attitude[0,0])
+                 guided=self._command(stamp,yaw,frame)
+                 return planned if guided is None else guided
+@@ -297,7 +395,71 @@ class BoxServo:
+                 self.control_lock.release()
+         return velocity
+ 
++    def _entry_allowed(self,t,frame,lateral):
++        # A newly processed RGB-D frame can still contain no observation of crate 0.
++        # A latched stop requires new camera evidence. Elapsed time never rearms it.
++        age=t-frame.first_seen
++        fresh=0<=age<FIRST_BOX_LEASE_S or (0<=age<self.entry_evidence_lease(frame) and abs(lateral)<.055)
++        visual_error=(frame.first_relative[1]+frame.side*.42
++                      if frame.first_relative is not None else None)
++        conflicting=(fresh and frame.first_seen_streak and visual_error is not None
++                     and abs(visual_error-lateral)>.11)
++        error=abs(lateral)
++        if self.entry_hold:
++            observed=(0<=age<FIRST_BOX_LEASE_S and frame.first_seen_streak>=2
++                      and frame.previous_first_seen>self.hold_since)
++            agrees=(visual_error is not None and abs(visual_error-lateral)<.065)
++            progressed=(self.entry_hold!='no_progress' or error<=self.hold_error-.018 or error<.045)
++            if not (observed and agrees and progressed):
++                return False
++            self.entry_hold=None
++            self.entry_epoch+=1
++            self.recovered_entry=True
++            self.restart_witness=None
++            self.progress_stamp=None
++        if not fresh:
++            reason='first_crate_lost'
++        elif conflicting:
++            reason='visual_pose_disagreement'
++        else:
++            if self.progress_stamp is None or error<.06 or error<=self.progress_error-.018:
++                self.progress_stamp=t
++                self.progress_error=error
++            reason='no_progress' if t-self.progress_stamp>=.95 else None
++        if reason:
++            self.entry_hold=reason
++            self.entry_epoch+=1
++            self.hold_since=t
++            self.hold_error=error
++            return False
++        return True
++
++    def _restart_stalled_entry(self,t,frame,pos,vel,dx,lateral,vx):
++        # After stopping, the stock gait can remain in double support even as
++        # forward velocity is requested. Authorize one bounded yaw pulse only
++        # when live crate range and odometry both confirm no forward progress.
++        measured_range=None
++        if self.phase=='enter' and frame.first_seen_streak and 0<=t-frame.first_seen<=.40:
++            measured_range=frame.first_relative[0]
++        elif self.phase=='along' and self.index==0 and 0<=t-frame.corroborated_stamp<=.40:
++            measured_range=frame.neighbor_range
++        if (self.restart_used or not self.recovered_entry or measured_range is None
++                or dx<.16 or abs(lateral)>.08 or vx<.16):
++            self.restart_witness=None
++            return
++        if self.restart_witness is not None:
++            since,first_x,first_range=self.restart_witness
++            if abs(pos[0]-first_x)<.030 and abs(measured_range-first_range)<.065:
++                if t-since>=.65 and abs(vel[0])<.07 and abs(vel[1])<.08:
++                    self.restart_until=t+.45
++                    self.restart_used=True
++                    self.restart_phase=self.phase
++                return
++        self.restart_witness=(t,pos[0],measured_range)
++
+     def _command(self,t,yaw,frame):
++        if self.entry_hold and frame is not None and (not frame.centers or not frame.side):
++            return np.zeros(3)
+         if frame is None or not frame.centers or not frame.side or self.done or self.index>=len(frame.centers):return None
+         i=self.index
+         center=frame.centers[i]
+@@ -346,7 +508,25 @@ class BoxServo:
+             pulse_on=elapsed_us%300_000<105_000
+             vx=.20 if dx>.055 and ahead>.045 and pulse_on else 0.
+         self.target=[float(target_x),float(y)];self.error=[float(dx),float(lateral)]
+-        if self.phase=='enter' and abs(lateral)<.035 and dx<.065:
++        if self.phase=='enter' and not self._entry_allowed(t,frame,lateral):
++            # Stop lateral drive; a measured neighboring pair may establish that
++            # entry is already complete, without extending the lateral pursuit.
++            pair=frame.corroborated_relative
++            last=frame.first_relative
++            if (self.entry_hold=='first_crate_lost' and pair is not None and last is not None
++                    and 0<=t-frame.corroborated_stamp<=FIRST_BOX_LEASE_S and 0<=t-frame.first_seen<=2.5
++                    and .24<last[0]<.80 and abs(last[1]+side*.42)<.12
++                    and abs(pair[0]-.36)<.10 and abs(pair[1]+side*.42)<.06
++                    and abs(lateral)<.035 and abs(dx)<.065 and abs(vy0)<.10):
++                self.phase='along'
++                self.along_started=t
++                self.entry_hold=None
++                self.recovered_entry=True
++                self.restart_witness=None
++                self.entry_epoch+=1
++            self.last_cmd=np.zeros(3)
++            return self.last_cmd.copy()
++        if self.phase=='enter' and 0<=t-frame.first_seen<FIRST_BOX_LEASE_S and abs(lateral)<.035 and dx<.065:
+             self.phase='along'
+             self.along_started=t
+         if self.phase=='along' and abs(dx)<.040 and abs(vx0)<.09:
+@@ -362,12 +542,30 @@ class BoxServo:
+         heading_error=wrap(frame.heading-yaw)
+         body=np.array([vx,vy])@rot(frame.heading).T@rot(yaw)
+         w=np.clip(2.4*heading_error,-.5,.5)
+-        if t<frame.kick_until and abs(w)<.20:w=.23
++        self._restart_stalled_entry(t,frame,pos,vel,dx,lateral,vx)
++        if t<frame.kick_until and abs(w)<.20:
++            w=.23
++        if self.phase==self.restart_phase and t<self.restart_until and abs(w)<.20:
++            if self.phase=='enter':
++                w=.23
++            elif frame.neighbor_range is not None and 0<=t-frame.corroborated_stamp<=.40:
++                if self.restart_origin is None:
++                    self.restart_origin=yaw
++                    to_axis=wrap(frame.heading-yaw)
++                    self.restart_direction=np.sign(to_axis) if abs(to_axis)>.015 else frame.side
++                w=self.restart_direction*.45 if abs(wrap(yaw-self.restart_origin))<.10 else 0.
++        if self.phase=='enter' and t-frame.first_seen>=FIRST_BOX_LEASE_S and np.linalg.norm(body)>.085:
++            self.last_cmd=np.zeros(3)
++            return self.last_cmd.copy()
+         self.last_cmd=np.r_[body,w]
+         return self.last_cmd.copy()
+ 
+     def diagnostic(self):
+         return dict(crate_phase=self.phase,crate_index=self.index,crate_side=float(self.side),
++                    crate_entry_hold=self.entry_hold,crate_refined_third=self.refined_third,crate_restart_used=self.restart_used,crate_restart_until=self.restart_until if self.restart_used else None,crate_first_match_time=None if self.first_relative is None else self.first_seen,
++                    crate_first_relative=None if self.frame is None or self.frame.first_relative is None else self.frame.first_relative.tolist(),
++                    crate_neighbors=self.neighbor_estimates,
++                    crate_neighbor_relative=None if self.frame is None or self.frame.corroborated_relative is None else self.frame.corroborated_relative.tolist(),
+                     crate_pose=self.pos.tolist(),crate_velocity=self.velocity.tolist(),crate_heading=self.heading,
+                     crate_centers=[v.tolist() for v in self.boxes],crate_visible=self.visible,
+                     crate_residuals=self.corrections,crate_target=self.target,crate_error=self.error,crate_done=self.done)
+diff --git a/navigation/runtime.py b/navigation/runtime.py
+index da8e8db11efe92647184db6a503341e838d4a481..e261e7b876652f2a232070eff31d20d64787dc36 100644
+--- a/navigation/runtime.py
++++ b/navigation/runtime.py
+@@ -644,11 +644,11 @@ class OnboardNavigation:
+         self._box_publication=None
+         if guided is not None:
+             frame=self.crates.frame
+-            self.deadline=min(self.deadline,frame.stamp+self.lease)
++            self.deadline=self.crates.observation_deadline(frame,min(self.deadline,frame.stamp+self.lease))
+             self._box_publication=self.crates.publication(frame,self.deadline)
+             self.desired=guided
+             self.lane_turn.pause(timestamp)
+-            self.reason='box_'+self.crates.phase
++            self.reason='box_entry_hold' if self.crates.entry_hold else 'box_'+self.crates.phase
+             return self.adapter.update(self.desired,enabled=True)
+         if (enabled and self.reason not in ('stale_imu', 'stale_camera', 'unusable_rgb') and
+                 not self.tracking_control and self.edge_correction is not None and
+diff --git a/release_manifest.json b/release_manifest.json
+index bfe01c625d2a7a2875b6061b734207f95c2c6eb8..af800b1de1b25ee2c6114008ac0403ddb25a6caa 100644
+--- a/release_manifest.json
++++ b/release_manifest.json
+@@ -1,10 +1,10 @@
+ {
+-  "release_id": "shared_nav_20261111_rt11",
++  "release_id": "shared_nav_20261111_rt13",
+   "python": ">=3.8",
+   "navigation_core_sha256": {
+     "__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+     "amp_contract.json": "d128ef7d1c039901d80ccc6d522d83cada396970b9ee4612ff330d4c38aac76b",
+-    "box_servo.py": "573def60b3796dc6dcb64326839638b739e320e3fdf81fa763457e64a462c624",
++    "box_servo.py": "5a6dc9e021febb8a310ac76f5e901cca5ea2d0f86fc93b8c35d6f32075606cc2",
+     "calibration.py": "42f46aded85643151027eadd3b6cbf1a8d53c446fd473787180d0bf57f072f48",
+     "command.py": "f9704718503c19da9a95d6d6052325db6bd68593858151d609bdcb5a2b79f734",
+     "dependencies.json": "ab15eb730632c982638ec9c26863037d8720b5df22eb7590d6434342750fd599",
+@@ -16,47 +16,47 @@
+     "leg_odometry.py": "02ef5eae50b97b2a00cafc35df2d5cf4bcadb757bd93116ff9361fedc66ce24d",
+     "motion_recovery.py": "fa27ad9e49b8debd593b6ddc6a323210bf320d443f8397a92a940cccf0a83891",
+     "release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+-    "runtime.py": "c360327208c329517dd3d7ea1e248c44b671ad63530b8c07a64a00165326ca76",
++    "runtime.py": "ec984e621b250676ab3f999fbc78c41d1ce08d785e42bcd3ba77000c50238d6b",
+     "surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+     "visual.py": "41e48d71cb66716237b9af8d7578408f0dd4ee931e2184045caf087fcab22428"
+   },
+   "factory_contract": {
+-    "schema": 1,
+-    "policy_name": "walk/pi_plus_amp_1110_policy_1.rknn",
+-    "mode": "Soccer/normal",
+-    "rl_hz": 50,
+-    "pd_hz": 1000,
+     "alpha": 0.3,
+-    "scale": [
+-      1.0,
+-      1.0,
+-      1.0
++    "controller_binary_sha256": "e17157bc2ade8a0342b18aad74979e37df1a22c97d169f7ed77416c67f27985d",
++    "deadband": [
++      0.08,
++      0.08,
++      0.17
+     ],
+     "lower": [
+       -0.8,
+       -0.5,
+       -1.57
+     ],
+-    "upper": [
+-      0.8,
+-      0.5,
+-      1.57
+-    ],
+-    "deadband": [
+-      0.08,
+-      0.08,
+-      0.17
++    "mode": "Soccer/normal",
++    "pd_hz": 1000,
++    "policy_name": "walk/pi_plus_amp_1110_policy_1.rknn",
++    "rl_hz": 50,
++    "scale": [
++      1.0,
++      1.0,
++      1.0
+     ],
++    "schema": 1,
+     "sha256": {
+-      "amp.yaml": "a31a6dd7b9b77aca9d73f93f812897cb64cdb7f97217bda11d61b4a0c85ed10b",
+       "amp.trt": "49a64fc175dc9719554e246d42e2ccc0fa4dda97f672a66076a9e02dd8b97c13",
++      "amp.yaml": "a31a6dd7b9b77aca9d73f93f812897cb64cdb7f97217bda11d61b4a0c85ed10b",
+       "pd.yaml": "fa0f04a3b49d72ac0825a6cfeb523e34ecf1aa68477bd49e8042d3256c7b11a0"
+     },
+-    "controller_binary_sha256": "e17157bc2ade8a0342b18aad74979e37df1a22c97d169f7ed77416c67f27985d"
++    "upper": [
++      0.8,
++      0.5,
++      1.57
++    ]
+   },
+   "files": {
+     "SHARED_NAVIGATION_STATUS.md": "d2a367de7fbe51f198147cc1a9a7c5f8c655674133844849eb3bb607d699e37b",
+-    "deploy/NOSTOP.md": "50f2f895b43f1c459a0717361a6721cd202acfa7f225a497fe467ae5394d106a",
++    "deploy/NOSTOP.md": "a72771e65717ce0badfac333024a32ab1ffd9502fdb19ee03db3be394b9f428b",
+     "deploy/README.md": "07a2d6fc746c138c021d457be8bdab0a16b442ff421fe586f7634dbf544feb4e",
+     "deploy/SHARED_NAVIGATION.md": "3fb98446345e044783de6bffecd8227d1d495da6c163048d1618610c7e1961e3",
+     "deploy/calibrate_ground.py": "e62583349e2e80a65a542e7c9947ac1c830b92c35ad732ff70f35c7830937044",
+@@ -87,7 +87,7 @@
+     "deploy/task_head_pose.json": "fe2f430b11a1bed540fb046415886082213fe231342ebd05f62a6910c44bbc6f",
+     "navigation/__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+     "navigation/amp_contract.json": "d128ef7d1c039901d80ccc6d522d83cada396970b9ee4612ff330d4c38aac76b",
+-    "navigation/box_servo.py": "573def60b3796dc6dcb64326839638b739e320e3fdf81fa763457e64a462c624",
++    "navigation/box_servo.py": "5a6dc9e021febb8a310ac76f5e901cca5ea2d0f86fc93b8c35d6f32075606cc2",
+     "navigation/calibration.py": "42f46aded85643151027eadd3b6cbf1a8d53c446fd473787180d0bf57f072f48",
+     "navigation/command.py": "f9704718503c19da9a95d6d6052325db6bd68593858151d609bdcb5a2b79f734",
+     "navigation/dependencies.json": "ab15eb730632c982638ec9c26863037d8720b5df22eb7590d6434342750fd599",
+@@ -99,7 +99,7 @@
+     "navigation/leg_odometry.py": "02ef5eae50b97b2a00cafc35df2d5cf4bcadb757bd93116ff9361fedc66ce24d",
+     "navigation/motion_recovery.py": "fa27ad9e49b8debd593b6ddc6a323210bf320d443f8397a92a940cccf0a83891",
+     "navigation/release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+-    "navigation/runtime.py": "c360327208c329517dd3d7ea1e248c44b671ad63530b8c07a64a00165326ca76",
++    "navigation/runtime.py": "ec984e621b250676ab3f999fbc78c41d1ce08d785e42bcd3ba77000c50238d6b",
+     "navigation/surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+     "navigation/visual.py": "41e48d71cb66716237b9af8d7578408f0dd4ee931e2184045caf087fcab22428",
+     "reference/robot/PiPlusPro_SF_12L8A0G2H0W_Z_261010/urdf/PiPlusPro_SF_12L8A0G2H0W_Z_261010.urdf": "5169fe5d59eae117c006232b7512a0e28347383187482c05619487f19831a69c",
+@@ -120,8 +120,9 @@
+     "scripts/test_navigation_buttons.py": "4d768fe7a413598c2d703553725f0205b8f3d00a826843324e65b42c606c28e0",
+     "scripts/test_navigation_cli.py": "a4870ebb8c66094d02dd97d603ffc8658c3d832f7f4923ae98676470d6f4a1fd",
+     "scripts/test_rgbd_odometry.py": "00114e9e00e95a09cf0e83109a72dc793b8b1ea38152acb9dc6320f766e3201f",
+-    "scripts/test_rt11_box_publication.py": "d571ec7b3266bc395adcc07c76c688a20ded000c5488ce7bdd44d34f03a299bb",
+-    "scripts/test_rt11_box_visibility.py": "cf7809139d218613cb327ad90f6ff60681fb35774e37bd8af3c3e7a346101596",
++    "scripts/test_rt11_box_publication.py": "ce746e9b73a8514963303ecd52ba713520f3b188303f363b05b493389ad087ef",
++    "scripts/test_rt11_box_visibility.py": "1ae79c0f001aa17c86841cb6a1183967440ce404f8d90b81dc0731674db3c705",
++    "scripts/test_rt13_entry_recovery.py": "5c676f1b7d545efe839bb6e2afeb3636e0a4950011422f8391f1d467d42155da",
+     "scripts/test_sensor_recovery.py": "1405a42934f58e841d0cbe4dfc48e162519bf3f31b9357b801211bc3dd5e022f",
+     "scripts/test_shared_navigation.py": "d92209f27b25d35d5987292a8d8606db5b28eeeafef237a8f252793589901444",
+     "scripts/test_single_boundary.py": "ad15b9263030f9115a2d5a212aa64f706c535daa56bc5f7765b5b5a7ead00214",
+@@ -137,7 +138,7 @@
+   "default_mode": "shadow_without_motor_publishers",
+   "real_motion_requires": "verified camera/IMU calibration, current sensors, immutable AMP identity, sole guarded publisher",
+   "nostop_policy": "Mission duration inherited from rt10; local manoeuvres may request zero velocity.",
+-  "parent_release_id": "shared_nav_20261111_rt10",
+-  "parent_manifest_sha256": "18e9e2bc53dfd6bba9735b463eb5db353d8e6b752f9c8ec7f030ed526c776fec",
+-  "validation_scope": "MuJoCo; derived from measured rt10 camera/guard schedules; no robot motion validation."
++  "parent_release_id": "shared_nav_20261111_rt11",
++  "parent_manifest_sha256": "8cf0c5df6c9acd3f3e455d7356f816681a887a86a58e6c4ed4f8df52a3b46987",
++  "validation_scope": "Local MuJoCo and offline telemetry. Robot motion is outside this archive's validation scope."
+ }
+diff --git a/scripts/test_rt11_box_publication.py b/scripts/test_rt11_box_publication.py
+index fcbf86d1ea9897624a8b6d2873d05eaaab6b3bdc..5952acfb03221b136e2d5be1074133f2ddb39f88 100644
+--- a/scripts/test_rt11_box_publication.py
++++ b/scripts/test_rt11_box_publication.py
+@@ -18,7 +18,7 @@ class BoxPublicationTest(unittest.TestCase):
+         self.vector = (.10, .02, .01)
+         self.imu = (.2, [0., 0., 0., 1.])
+         self.frame = BoxFrame(np.zeros(2), np.zeros(2), (np.array([1., .13]),),
+-                              0., 1., 0., None, 0.)
++                              0., 1., 0., None, 0., first_seen=0.)
+         self.nav.pending_frame = self.frame
+         self.nav.commit_frame()
+         self.plan = PublishedPlan(vector=self.vector, deadline=1., reason='box_enter',
+@@ -69,7 +69,7 @@ class BoxPublicationTest(unittest.TestCase):
+         expected=(.2, .2, 0., 0., 0., .2, .2, 0.)
+         for origin in (17.5213, 56231.271, 3285599.063801):
+             nav=BoxServo()
+-            frame=replace(self.frame, stamp=origin, position=np.zeros(2),
++            frame=replace(self.frame, stamp=origin, first_seen=origin, position=np.zeros(2),
+                           centers=(np.array([.36,-.42]),))
+             nav.frame=frame
+             nav.command(origin, 0.)
+diff --git a/scripts/test_rt11_box_visibility.py b/scripts/test_rt11_box_visibility.py
+index 7a91083b69e7937f0da58fdd5afc79786852fd00..b7f399c98bccb55c89ba07100197dec925138123 100644
+--- a/scripts/test_rt11_box_visibility.py
++++ b/scripts/test_rt11_box_visibility.py
+@@ -37,6 +37,7 @@ class VisibilityTest(unittest.TestCase):
+         self.nav.commit_frame()
+ 
+     def test_floor_only_then_lost_depth(self):
++        self.nav.first_seen=.99  # The previously measured first crate is still fresh at 1.5 s.
+         directions=self.cam.rays@self.cam.rotation32.T
+         depth=(-.45-self.cam.position32[2])/directions[...,2]
+         depth[(depth<.15)|(depth>4.)]=np.nan
+@@ -53,7 +54,7 @@ class VisibilityTest(unittest.TestCase):
+         np.testing.assert_equal(hook(2.,np.ones(3),self.rotation),np.zeros(3))
+ 
+     def test_encoder_outage_uses_frame_velocity(self):
+-        frame=BoxFrame(np.zeros(2),np.array([.10,0.]),tuple(self.nav.boxes),0.,1.,1.,np.zeros(2),0.)
++        frame=BoxFrame(np.zeros(2),np.array([.10,0.]),tuple(self.nav.boxes),0.,1.,1.,np.zeros(2),0.,first_seen=1.)
+         self.nav.frame=frame
+         self.nav.latest_leg=(1.,np.array([.30,0.]),np.zeros(2))
+         self.nav.command(1.05,0.)
+diff --git a/scripts/test_rt13_entry_recovery.py b/scripts/test_rt13_entry_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3dc4eddb12cf0649e7b6d9aea4468820b260eba
+--- /dev/null
++++ b/scripts/test_rt13_entry_recovery.py
+@@ -0,0 +1,92 @@
++"""First-crate observation leases apply to navigation and its concurrent publisher."""
++from dataclasses import replace
++from pathlib import Path
++import sys
++import unittest
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from navigation.box_servo import BoxFrame, BoxServo, FIRST_BOX_LEASE_S
++
++
++class EntryRecoveryTest(unittest.TestCase):
++    def setUp(self):
++        self.nav = BoxServo()
++        self.frame = BoxFrame(np.zeros(2), np.zeros(2), (np.array([1., -.12]),),
++                              0., 1., 10., None, 0., first_seen=10.,
++                              first_relative=np.array([1.,-.12]), first_seen_streak=2,
++                              previous_first_seen=9.8)
++        self.nav.frame = self.frame
++        self.attitude = np.eye(3)
++
++    def test_unrelated_fresh_frames_and_stale_publisher_cannot_restore_motion(self):
++        planned = self.nav.command(10.02, 0.)
++        self.assertGreater(planned[1], .2)
++        old_hook = self.nav.publication(self.frame, 20.)
++        with self.nav.control_lock:
++            np.testing.assert_array_equal(old_hook(10.+FIRST_BOX_LEASE_S, planned, self.attitude), 0.)
++        self.nav.frame = replace(self.frame, stamp=11., first_seen_streak=0)
++        np.testing.assert_array_equal(self.nav.command(11.05, 0.), 0.)
++        self.assertEqual(self.nav.entry_hold, 'first_crate_lost')
++        self.nav.frame = replace(self.frame, stamp=12., first_seen=12., first_seen_streak=1)
++        for stamp in (12., 12.02, 12.1):
++            np.testing.assert_array_equal(self.nav.command(stamp, 0.), 0.)
++        self.nav.frame = replace(self.frame, stamp=12.2, first_seen=12.2,
++                                 previous_first_seen=12., first_seen_streak=2)
++        self.assertGreater(self.nav.command(12.22, 0.)[1], .2)
++        self.assertEqual(self.nav.index, 0)
++        np.testing.assert_array_equal(old_hook(12.23, planned, self.attitude), 0.)
++
++    def test_frozen_pose_does_not_rearm_on_fresh_detections(self):
++        for t in np.arange(10., 13., .1):
++            self.nav.frame = replace(self.frame, stamp=t, first_seen=t,
++                                     previous_first_seen=t-.1, first_seen_streak=2)
++            self.nav.command(t+.01, 0.)
++        self.assertEqual(self.nav.entry_hold, 'no_progress')
++        np.testing.assert_array_equal(self.nav.last_cmd, 0.)
++        self.nav.frame = replace(self.nav.frame, position=np.array([.1,.08]),
++                                 first_relative=np.array([.9,-.20]))
++        self.assertGreater(self.nav.command(13., 0.)[1], 0.)
++
++    def test_current_visual_pose_must_agree_to_resume(self):
++        self.nav.command(10.01, 0.)
++        self.nav.frame = replace(self.frame, stamp=11., first_seen_streak=0)
++        self.nav.command(11.03, 0.)
++        self.nav.frame = replace(self.frame, stamp=12.2, first_seen=12.2,
++                                 previous_first_seen=12., first_relative=np.array([.8,-.4]))
++        np.testing.assert_array_equal(self.nav.command(12.24, 0.), 0.)
++        self.assertTrue(self.nav.entry_hold)
++
++    def test_braking_grace_needs_current_nearby_crate_and_small_velocity(self):
++        aligned = replace(self.frame, first_relative=np.array([.52,-.40]))
++        self.assertAlmostEqual(self.nav.observation_deadline(aligned,20.),10.74)
++        lost = replace(aligned, first_seen_streak=0)
++        self.assertAlmostEqual(self.nav.observation_deadline(lost,20.),10.+FIRST_BOX_LEASE_S)
++        self.nav.frame = aligned
++        hook = self.nav.publication(aligned,20.)
++        with self.nav.control_lock:
++            np.testing.assert_array_equal(hook(10.6,np.array([0.,.26,0.]),self.attitude),0.)
++            np.testing.assert_array_equal(hook(10.75,np.array([0.,.02,0.]),self.attitude),0.)
++        self.nav.frame = replace(aligned, position=np.array([.61,.29]))
++        self.nav.command(10.60, 0.)
++        self.assertEqual(self.nav.phase,'enter')
++
++    def test_two_later_landmarks_can_confirm_completion_but_not_resume_strafe(self):
++        self.nav.command(10.01, 0.)
++        # The first crate was already seen on the passing side. Both later
++        # crates now place it at the entrance goal.
++        self.nav.frame = replace(self.frame, stamp=11., first_seen_streak=0,
++                                 first_relative=np.array([.55,-.41]),
++                                 corroborated_relative=np.array([.39,-.42]), corroborated_stamp=11.)
++        np.testing.assert_array_equal(self.nav.command(11.03, 0.), 0.)
++        self.assertTrue(self.nav.entry_hold)
++        self.assertEqual(self.nav.index, 0)
++        self.nav.frame = replace(self.nav.frame, position=np.array([.61,.29]))
++        np.testing.assert_array_equal(self.nav.command(11.05, 0.), 0.)
++        self.assertEqual(self.nav.phase, 'along')
++        self.assertIsNone(self.nav.entry_hold)
++
++
++if __name__ == '__main__':
++    unittest.main()

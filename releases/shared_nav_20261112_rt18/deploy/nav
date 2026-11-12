@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -eo pipefail
+nav_script="$(readlink -f "${BASH_SOURCE[0]}")"
+nav_root="$(cd "$(dirname "$nav_script")/.." && pwd)"
+source /opt/ros/noetic/setup.bash
+source /home/nvidia/sim2real/install/setup.bash
+exec "$nav_root/.venv/bin/python" "$nav_root/deploy/navigation_cli.py" "$@"

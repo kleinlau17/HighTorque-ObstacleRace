@@ -64,11 +64,11 @@ class BoxPanelTest(unittest.TestCase):
         self.assertEqual(self.request('/api/state')[1]['control']['applied'], values)
 
     def test_first_box_gate_and_side_limit_and_distance(self):
-        for threshold, expected_axis in [(39, 0), (42, 1)]:
+        for threshold, expected_axis in [(39, 0), (44, 1)]:
             nav = BoxServo()
             nav.queue_tuning(1, dict(asdict(BoxTuning()), first_gap=threshold, side_speed=10, side_step=2.))
-            nav.approached = True
-            nav.frame = view(8., (.49, .45))  # first box is centred at y=.05, gap = 40 cm
+            nav.phase = 'along'
+            nav.frame = view(8., (.49, .47))  # body aligned over the opposite boundary
             cmd = nav.command(8.01, 0.)
             self.assertEqual(nav.steps.active['axis'], expected_axis)
             self.assertAlmostEqual(nav.panel_status(8.01)['gap'], 40.)

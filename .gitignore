@@ -25,3 +25,6 @@ MUJOCO_LOG.TXT
 !vendor/
 vendor/*
 !vendor/pi_plus_pro/
+
+# Local vendor export of the robot package (72 MB, not source)
+/PiPlusPro_SF_*/

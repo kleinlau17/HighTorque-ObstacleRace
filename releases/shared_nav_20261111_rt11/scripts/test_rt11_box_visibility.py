@@ -12,6 +12,7 @@ import numpy as np
 SOURCE=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(SOURCE))
 from navigation.box_servo import BoxFrame, BoxServo
+from test_rt11_box_steps import edges_at
 from navigation.leg_odometry import LEG_JOINTS
 from navigation.runtime import CameraFrame
 from navigation.visual import CameraPerception
@@ -59,18 +60,19 @@ class VisibilityTest(unittest.TestCase):
         frame=BoxFrame(np.zeros(2),np.array([.10,0.]),tuple(self.nav.boxes),0.,1.,1.,np.zeros(2),0.)
         self.nav.phase='along'
         self.nav.along_started=1.
-        self.nav.frame=replace(frame,position=np.array([0.,.30]),identified=(0,),axis_evidence=(True,True),visual_xy=(.30,.30))
+        self.nav.frame=replace(frame,position=np.array([0.,.30]),edges=edges_at(.47),previous_edges=edges_at(.47),
+                               previous_stamp=.90,progress_x=.30,forward_room=.12,depth_status='depth_clear',identified=(0,),axis_evidence=(True,True),visual_xy=(.30,.30))
         self.nav.latest_leg=(1.,np.array([.30,0.]),np.zeros(2))
         self.nav.command(1.05,0.)
-        self.assertAlmostEqual(self.nav.error[0],(1.+1.55)/2-.037-.30)
+        self.assertAlmostEqual(self.nav.steps.active['origin'][0],.30)
         # Inspect the captured-pose fallback in a new plan. The elapsed first
         # step separately requires an acknowledged stop before it can move again.
         self.nav.steps.stop(1.10)
         np.testing.assert_equal(self.nav.command(1.4,0.), np.zeros(3))
         self.nav.steps.published(1.41,np.zeros(3))
-        self.nav.frame=replace(self.nav.frame,stamp=1.42)
+        self.nav.frame=replace(self.nav.frame,stamp=1.44,previous_stamp=1.42,progress_x=.32)
         self.nav.command(1.45,0.)
-        self.assertAlmostEqual(self.nav.error[0],(1.+1.55)/2-.037-.10*.03)
+        self.assertAlmostEqual(self.nav.steps.active['origin'][0],.10*.01)
 
     def test_encoder_restart_does_not_integrate_missing_time(self):
         joints=dict.fromkeys(LEG_JOINTS,0.)
@@ -87,7 +89,8 @@ class VisibilityTest(unittest.TestCase):
         self.nav.phase='lane_entry'
         self.nav.frame=BoxFrame(np.array([2.53,0.]),np.zeros(2),tuple(self.nav.boxes),
                                 0.,1.,1.,None,0.)
-        self.nav.frame=replace(self.nav.frame,stamp=1.,tape_fix=True,tape_longitudinal=True,visual_xy=(2.53,0.))
+        self.nav.frame=replace(self.nav.frame,stamp=1.,tape_fix=True,tape_longitudinal=True,visual_xy=(2.53,0.),progress_x=2.53,
+                               edges=edges_at(.22),previous_edges=edges_at(.22),previous_stamp=.9)
         self.assertIsNone(self.nav.command(1.,0.))
         self.assertTrue(self.nav.done)
         self.assertIsNone(self.nav.command(20.,0.))

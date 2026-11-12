@@ -1,0 +1,50 @@
+{
+  "robot_type": "pi_plus-S-12L8A0G2H0W",
+  "camera_mount": "movable_head",
+  "extrinsics_verified": false,
+  "camera_position_body_m": [
+    0.09915695043861596,
+    0.03123399999999999,
+    0.24142122775620944
+  ],
+  "camera_rotation_optical_to_body": [
+    [
+      0.001826723659722751,
+      -0.628700912538873,
+      0.7776450511984625
+    ],
+    [
+      -0.9999047803235637,
+      0.009488468738656886,
+      0.0100199424689561
+    ],
+    [
+      -0.013678207731887604,
+      -0.7775893077542823,
+      -0.6286237150310664
+    ]
+  ],
+  "imu_alignment_verified": false,
+  "body_from_imu": [
+    [
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "note": "Shadow simulation reference from the Pro head chain at the measured standby joint feedback. Optical center and IMU alignment remain unverified on hardware.",
+  "head_reference_rad": {
+    "head_pitch_joint": 0.6383716464042664,
+    "head_yaw_joint": 0.0
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "source": "output/deployment/head_adjustment_20261110/verified_evidence/runs/head_adjust/final_view",
+  "standby_base_roll_pitch_deg": [
+    -1.2597014597499923,
+    5.017899498279545
+  ],
+  "standby_normal_optical": [
+    0.00811555570519921,
+    -0.7196391697113281,
+    -0.6943008016506861
+  ],
+  "position_camera_link_m": [
+    0.02256,
+    0.0,
+    0.0
+  ],
+  "xyaxes_camera_link": [
+    0.009617669179946737,
+    -0.9999047803235638,
+    -0.009895995434051053,
+    0.04153247463792798,
+    -0.009488468738656837,
+    0.999092099113713
+  ],
+  "assumptions": "Mean of 18 AHRS attitudes treated as body attitude. At the measured head reference the smallest rotation from forward-facing optics matches the fitted ground normal. Heading about gravity is unobserved. Lens center approximated at the mesh front face on camera_link Y=Z=0; optical translation and IMU alignment are unverified."
+}

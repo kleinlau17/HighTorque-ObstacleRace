@@ -11,6 +11,21 @@ FIELDS = (
     ('first_gap', '首箱横向让开距离', 'cm', 36., 45., .5),
 )
 
+DEPTH_REASON_TEXT = {
+    'missing_ground_plane': '等待深度相机测出地面',
+    'missing_body_geometry': '等待与画面时间匹配的手脚位置',
+    'missing_capture_body': '拍照时缺少手脚位置，等待下一帧',
+    'stale_capture_body': '拍照时的关节反馈已过期',
+    'interrupted_body_history': '拍照后的关节反馈有间断，等待重新确认',
+    'stale_live_body': '迈步前的手脚位置尚未更新',
+    'insufficient_floor': '前方可测到的地面太少',
+    'missing_floor_band': '深度画面尚未覆盖车身两侧的地面',
+    'inconsistent_corridor': '两侧测量不一致，等待新画面',
+    'unseen_swept_path': '下一步手脚经过的位置仍有深度盲区',
+    'obstacle_in_step': '下一步可能碰到障碍，重新观察',
+    'invalid_step_length': '前进一步的距离超出范围',
+}
+
 
 @dataclass(frozen=True)
 class BoxTuning:

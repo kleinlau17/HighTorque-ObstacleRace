@@ -1,0 +1,82 @@
+--- a/navigation/observed_footing.py
++++ b/navigation/observed_footing.py
+@@ -102,18 +102,18 @@
+         intercept=plane.offset+float(normal@attitude@camera.position32)
+         height=depth*plane_ray+intercept
+         surface=np.isfinite(depth)&(depth>.15)&(depth<2.7)&(abs(height)<.025)
+-        interior=cv2.erode(surface.astype(np.uint8),_KERNEL,borderType=cv2.BORDER_CONSTANT,borderValue=0)
++        interior=cv2.erode(surface.astype(np.uint8),_KERNEL,borderType=cv2.BORDER_REPLICATE)
+         h,w=depth.shape
+         fx,fy,cx,cy=camera.intrinsics
+ 
+         # Project the centre and corners of each 2 cm world cell. Missing
+         # returns in the present frustum revoke old evidence immediately.
+-        # A previous observation survives only wholly outside the new view.
++        # A previous observation survives where the visible samples still agree.
+         centre=(_GRID+.5)*_CELL+(origin*_CELL-pose[:2]).astype(np.float32)
+         z=-(centre@normal[:2]+plane.offset)/normal[2]
+         optical=(np.column_stack((centre,z))@attitude-camera.position32)@camera.rotation32
+         basis=np.array([[1.,0.,-normal[0]/normal[2]],[0.,1.,-normal[1]/normal[2]]],np.float32)@rotation*_CELL
+-        in_view=np.zeros(len(centre),bool)
++        contradicted=np.zeros(len(centre),bool)
+         supported=np.ones(len(centre),bool)
+         for dx,dy in _OFFSETS:
+             points=optical+dx*basis[0]+dy*basis[1]
+@@ -122,10 +122,13 @@
+             u=np.rint(uv[:,0]*fx+cx).astype(np.int32)
+             v=np.rint(uv[:,1]*fy+cy).astype(np.int32)
+             visible=(distance>0.)&(u>=0)&(u<w)&(v>=0)&(v<h)
+-            in_view|=visible
+             good=np.zeros(len(centre),bool)
+             good[visible]=interior[v[visible],u[visible]]
+-            supported&=good
++            # Moving past a patch leaves some corners outside the image. That
++            # supplies no new evidence. A hole, drop or obstacle at any corner
++            # still in view revokes the whole cell, even on the image border.
++            contradicted |= visible & ~good
++            supported &= good & (u>0) & (v>0) & (u<w-1) & (v<h-1)
+         flat=seen.reshape(-1)
+-        flat[in_view]=-np.inf
++        flat[contradicted]=-np.inf
+         flat[supported]=stamp
+--- /dev/null
++++ b/checks/test_footing_frustum_exit.py
+@@ -0,0 +1,38 @@
++"""Run in the rt9 release's navigation environment, with PYTHONPATH set to the release root."""
++import unittest
++from types import SimpleNamespace
++
++import numpy as np
++
++from navigation.observed_footing import FloorHistory
++
++
++class FootingFrustumTest(unittest.TestCase):
++    def test_gradual_exit_and_visible_depth_hole(self):
++        # Downward inclined RGB-D camera on level ground. All uncorrupted
++        # pixel depths are analytical ray/plane intersections.
++        v, u = np.mgrid[:192, :256]
++        intrinsics = (242., 242., 128., 96.)
++        rays = np.stack(((u-128.)/242., (v-96.)/242., np.ones_like(u)), axis=-1)
++        c = np.sqrt(.5)
++        rotation = np.array([[0., -c, c], [-1., 0., 0.], [0., -c, -c]])
++        camera = SimpleNamespace(rays=rays, intrinsics=intrinsics,
++                                 rotation32=rotation, position32=np.array([.075, 0., 0.]))
++        plane = SimpleNamespace(valid=True, normal=np.array([0., 0., 1.]), offset=.45)
++        depth = (-plane.offset / (rays @ rotation[2])).astype(np.float32)
++        feet = np.array([[x, y] for x in np.linspace(.70, .80, 6)
++                          for y in np.linspace(.04, .08, 4)])
++
++        for corrupt in (False, True):
++            history = FloorHistory()
++            for i, x in enumerate(np.linspace(0., .72, 121)):
++                measurement = depth if not corrupt or i == 0 else np.full_like(depth, np.nan)
++                frame = SimpleNamespace(time=1+i*.025, depth=measurement)
++                view = history.observe(frame, np.eye(3), [x, 0., 0.], camera, plane)
++                if i == 0:
++                    self.assertTrue(view.supports(feet))
++            self.assertEqual(view.supports(feet-[x, 0.]), not corrupt)
++
++
++if __name__ == '__main__':
++    unittest.main()

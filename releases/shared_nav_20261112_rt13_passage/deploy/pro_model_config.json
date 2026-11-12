@@ -1,0 +1,65 @@
+{
+  "robot_type": "pi_plus-S-12L8A0G2H0W",
+  "camera_mount": "movable_head",
+  "calibration_basis": "robot_model_assumption",
+  "extrinsics_verified": false,
+  "imu_alignment_verified": false,
+  "camera_position_body_m": [
+    0.09915695043861596,
+    0.031233999999999998,
+    0.24142122775620958
+  ],
+  "camera_rotation_optical_to_body": [
+    [
+      0.0018267236597226543,
+      -0.6287009125388728,
+      0.7776450511984627
+    ],
+    [
+      -0.9999047803235638,
+      0.009488468738656839,
+      0.010019942468956025
+    ],
+    [
+      -0.013678207731887469,
+      -0.7775893077542825,
+      -0.6286237150310664
+    ]
+  ],
+  "body_from_imu": [
+    [
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "head_reference_rad": {
+    "head_pitch_joint": 0.6383716464042664,
+    "head_yaw_joint": 0.0
+  },
+  "calibration_evidence": {
+    "urdf_path": "reference/robot/PiPlusPro_SF_12L8A0G2H0W_Z_261010/urdf/PiPlusPro_SF_12L8A0G2H0W_Z_261010.urdf",
+    "urdf_sha256": "5169fe5d59eae117c006232b7512a0e28347383187482c05619487f19831a69c",
+    "optical_mount_path": "sim/pro_camera_mount.json",
+    "optical_mount_sha256": "026b1cf918a8976d16306117c86fcd4149b440911406b48620662db9301e038a",
+    "basis": "User selected robot-model geometry on 2026-11-11"
+  },
+  "assumptions": [
+    "Physical head encoder angles equal the URDF joint angles.",
+    "Camera optical mount equals sim/pro_camera_mount.json, including its estimated lens center and orientation.",
+    "AHRS orientation uses the base_link axes, matching the simulation IMU site."
+  ],
+  "note": "Model-derived test configuration selected by the user. Physical camera extrinsics and IMU alignment have not been independently measured.",
+  "perception_scale": 0.4,
+  "observation_lease_s": 1.0
+}

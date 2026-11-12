@@ -1,0 +1,17 @@
+{
+  "schema": "competition.task_head_pose.v1",
+  "mode": "Default/standby",
+  "joint_command_reference_rad": {
+    "head_pitch_joint": 0.6104601502418519,
+    "head_yaw_joint": 0.0
+  },
+  "measured_joint_reference_rad": {
+    "head_pitch_joint": 0.6383716464042664,
+    "head_yaw_joint": 0.0
+  },
+  "camera_downward_angle_deg": 43.971526294490396,
+  "calibration_path": "runs/head_adjust/final_view/ground_plane.json",
+  "body_extrinsics_verified": false,
+  "walking_persistence_verified": false,
+  "warning": "Reference measured on stand. Restore pitch and yaw with continuous bounded profiles through the original controller and verify joint feedback and the camera view."
+}

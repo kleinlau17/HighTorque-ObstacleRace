@@ -1,0 +1,309 @@
+diff --git a/deploy/stop_archive.py b/deploy/stop_archive.py
+index a82ca4db1bd548f93105f331587dd7d99569356b..4912a36adbf6e55d6a351f7a17f2dab01c38858c 100644
+--- a/deploy/stop_archive.py
++++ b/deploy/stop_archive.py
+@@ -169,6 +169,18 @@ class StopArchive:
+                 stamp = guard.get('navigation_stamp_ns')
+                 context = next((d for d in reversed(self.decisions.copy()) if d[0]==stamp), None)
+                 reason = context[1] if context else None
++                if (reason=='box_passage_unconfirmed' and 'passage_wait_frame' not in self.last_reported
++                        and guard['t']-self.current['stopped_at']>=4.):
++                    # The first zero may come from a previous capture's expiry.
++                    # Save one later RGB-D pair that actually produced the persistent wait.
++                    packet = next((p for p in reversed(self.frames.copy())
++                                   if p[0]['frame_timestamp_s']==context[3]), None)
++                    if packet is not None:
++                        self.last_reported.add('passage_wait_frame')
++                        self.enqueue(dict(event='stop_reason', stop_id=guard['stop_id'], reason=reason,
++                                          frame_relation='decision_frame', decision_frame_timestamp_s=context[3],
++                                          scene=context[2], monotonic_s=guard['t'], time=time.time(),
++                                          guard_reason=guard['reason']),packet)
+                 if reason in ('motion_stalled','turn_stalled') and reason not in self.last_reported:
+                     self.last_reported.add(reason)
+                     self.enqueue(dict(event='stop_reason',stop_id=guard['stop_id'],reason=reason,
+@@ -222,6 +234,8 @@ class StopArchive:
+         frame_time = packet[0]['frame_timestamp_s']
+         reference = row['frame_relation'].endswith('_reference')
+         basename = 'stops/%05d'%row['stop_id']+('_reference' if reference else '')
++        if row.get('event')=='stop_reason':
++            basename += '_passage_wait'
+         saved = self.encoded.get(frame_time)
+         if saved is None:
+             saved = save_frames(self.out,basename,packet)
+diff --git a/navigation/box_passage.py b/navigation/box_passage.py
+index 518be603b343286194ab1e26565d4d92a3add75b..cead1873edd25ae3c4ed5374348838c6595d3f43 100644
+--- a/navigation/box_passage.py
++++ b/navigation/box_passage.py
+@@ -84,34 +84,70 @@ LIMB_MARGIN = .010
+ # One foot must still have supported ground on the inside of that stripe.
+ TRUNK_OVER_PAINT = .020
+ MIN_OPEN_WIDTH = GapController.side_reach + LIMB_MARGIN - TRUNK_OVER_PAINT
++# Allow measurements of the crate's own surface just beyond its nominal
++# footprint. Charge that whole extension against the usable floor width.
++FACE_TOLERANCE = .012
++MAX_FACE_EXTENSION = .025
+ 
+ 
+ def measure_passages(edges, points, heights, center, previous_offset=0.):
++    widths, offsets, blocked, _ = _measure_passages(edges, points, heights, center, previous_offset, None)
++    return widths, offsets, blocked
++
++
++def _measure_passages(edges, points, heights, center, previous_offset, boundary):
+     """Right/left measured gap widths and usable target offsets, in metres."""
+     cx, cy = center
+     widths = [None, None]
+     offsets = [None, None]
+     blocked = [False, False]
++    observed_edges = [None, None]
+     x = points[:,0]-cx
++    raised = (heights>.10)&(heights<.65)
++    along_face = abs(x)<=BOX_HALF+FACE_TOLERANCE
+     for side_index, sign in enumerate((-1, 1)):
++        from_center = sign*(points[:,1]-cy)
++        near_face = (raised & along_face & (from_center>BOX_HALF+FACE_TOLERANCE)
++                     & (from_center<=BOX_HALF+MAX_FACE_EXTENSION))
++        face = float(np.max(from_center[near_face])) if np.any(near_face) else BOX_HALF
+         distances = []
++        under_crate = []
+         for edge in edges:
+             if cx < edge.near-.35 or cx > edge.far+.65 or abs(edge.slope)>.35:
+                 continue
+             # Measure at both ends of the box. Take the narrower clearance.
+-            bound = min(sign*(edge.at(x)-cy) for x in (cx-BOX_HALF,cx+BOX_HALF))
++            ends = [sign*(edge.at(station)-cy) for station in (cx-BOX_HALF,cx+BOX_HALF)]
++            bound = min(ends)
+             if 0 < bound <= .55:
+-                distances.append(bound-BOX_HALF)
+-        # A new solid return can invalidate a measured passage even when
+-        # the tape disappears. Never authorize one using an old width alone.
+-        y = sign*(points[:,1]-cy)-BOX_HALF
++                if max(ends)<=face and sign*edge.at(cx-.22)<0 and sign*edge.at(cx-BOX_HALF)<0:
++                    under_crate.append(bound-face)
++                else:
++                    distances.append((bound-face, edge))
++        # A protrusion beside the observed face consumes clearance. A return
++        # further into the passage, or ahead of that face, can revoke it even
++        # when the paint is out of view.
++        y = from_center-face
+         arm_limit = abs(previous_offset) if sign*previous_offset>0 else .42
+-        swept = ((abs(x)<.16)&(y>.012)&(y<arm_limit-BOX_HALF+GapController.side_reach)
+-                 &(heights>.10)&(heights<.65))
++        swept = ((abs(x)<.16) & (from_center>BOX_HALF+FACE_TOLERANCE)
++                 & (from_center<arm_limit+GapController.side_reach) & raised & ~near_face)
+         blocked[side_index] = np.count_nonzero(swept)>=5
+-        if not distances:
++        if sign*previous_offset>0 and face+GapController.side_reach+LIMB_MARGIN>abs(previous_offset):
++            blocked[side_index] = True
++        # A nearby stripe extrapolated through a crate can switch apparent
++        # sides as its last visible segment shortens. Only disambiguate it
++        # if the real outer stripe is independently remeasured at the
++        # previously confirmed clearance for this crate, with floor support.
++        if not distances and not under_crate:
+             continue
+-        width = max(0., min(distances))
++        width, outer = min(distances, key=lambda item:item[0]) if distances else (0., None)
++        matched_outer = False
++        if outer is not None and boundary is not None and under_crate and cx<.75:
++            old_sign, old_y, old_slope = boundary
++            matched_outer = (old_sign==sign and outer.near<=cx+.035 and outer.far>=cx-.16
++                             and abs(outer.at(cx)-cy-old_y)<.035 and abs(outer.slope-old_slope)<.12)
++        if under_crate and not matched_outer:
++            width = 0.
++        width = max(0., width)
+         widths[side_index] = width
+         if width < MIN_OPEN_WIDTH or blocked[side_index]:
+             blocked[side_index] = True
+@@ -123,11 +159,14 @@ def measure_passages(edges, points, heights, center, previous_offset=0.):
+         samples = np.histogram2d(x[floor],y[floor],
+             bins=([-.22,-.10,.10],np.linspace(.012,width,4)))[0]
+         if not np.all(samples>=3):
++            if matched_outer:
++                blocked[side_index] = True
+             continue
+         # Keep the established .42 m centerline for a nominal 30 cm gap,
+         # allowing 5 mm stripe-fit uncertainty. Tuck inward for a narrower gap.
+-        offsets[side_index] = .42 if width>=.295 else BOX_HALF+width+TRUNK_OVER_PAINT
+-    return tuple(widths), tuple(offsets), tuple(blocked)
++        offsets[side_index] = .42 if width>=.295 else face+width+TRUNK_OVER_PAINT
++        observed_edges[side_index] = ((sign, outer.at(cx)-cy, outer.slope), matched_outer)
++    return tuple(widths), tuple(offsets), tuple(blocked), observed_edges
+ 
+ 
+ @dataclass
+@@ -137,14 +176,23 @@ class PassageChoice:
+     vote_side: int = 0
+     vote_time: float = -np.inf
+     seen_at: float = -np.inf
++    boundary: tuple = ()
++    boundary_stamp: float = -np.inf
+ 
+     def observe(self, stamp, edges, xy, heights, center, max_age, lane_offset=None):
+         if stamp<=self.seen_at:
+             return
+         self.seen_at = stamp
+-        self.widths, offsets, blocked = measure_passages(edges, xy, heights, center, self.offset)
++        fresh_boundary = stamp-self.boundary_stamp<=max_age
++        self.widths, offsets, blocked, boundaries = _measure_passages(
++            edges, xy, heights, center, self.offset, self.boundary or None)
+         if self.offset and not blocked[int(self.offset>0)]:
+-            return
++            current = boundaries[int(self.offset>0)]
++            if current is None:
++                return
++            if fresh_boundary or not current[1]:
++                self.boundary, self.boundary_stamp = current[0], stamp
++                return
+         self.offset = 0.
+         available = [i for i in (0,1) if offsets[i] is not None]
+         if not available:
+@@ -161,6 +209,12 @@ class PassageChoice:
+         # stripe; it cannot create an opening without the depth-supported gap.
+         lane_confirmed = (lane_offset is not None and
+                           abs(sign*lane_offset-(self.widths[best]+BOX_HALF-.25))<.045)
+-        if paired or lane_confirmed or (self.vote_side==sign and stamp-self.vote_time<=max_age):
++        boundary, disambiguated = boundaries[best]
++        repeat = self.vote_side==sign and stamp-self.vote_time<=max_age
++        # After a gap, reacquire an ambiguous boundary only on two distinct
++        # floor-supported exposures. Its remembered geometry alone grants no motion.
++        corroborated = (paired or lane_confirmed) and (fresh_boundary or not disambiguated)
++        if repeat or corroborated:
+             self.offset = sign*offsets[best]
++            self.boundary, self.boundary_stamp = boundary, stamp
+         self.vote_side, self.vote_time = sign, stamp
+diff --git a/release_manifest.json b/release_manifest.json
+index 2824418b49272d1aaae18def48011e63c3e99e25..43e316a51f011505946a76a7385294cb22dfc4c9 100644
+--- a/release_manifest.json
++++ b/release_manifest.json
+@@ -1,11 +1,11 @@
+ {
+-  "release_id": "shared_nav_20261112_rt13_passage",
++  "release_id": "shared_nav_20261112_rt13_passage_recovery",
+   "python": ">=3.8",
+   "navigation_core_sha256": {
+     "__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+     "amp_contract.json": "d128ef7d1c039901d80ccc6d522d83cada396970b9ee4612ff330d4c38aac76b",
+     "box_body.py": "f78e0c9bfb39355d48bf8af33c776dab70b45e7e98cb5378d3d127212fb61ffa",
+-    "box_passage.py": "4ec25f0737a2a530d281c70759625639f5bd700751b7af9f9629962ca112d5d2",
++    "box_passage.py": "0a2d1be59c93de5742a416f2ea2e5ade39cd68ecc4e4b73c3992c10e09418b4b",
+     "box_servo.py": "ef62f30db6a30999bf9585a1de5c2d35db7a98bc7f8f90ea32a9f8c79774737c",
+     "calibration.py": "42f46aded85643151027eadd3b6cbf1a8d53c446fd473787180d0bf57f072f48",
+     "command.py": "f9704718503c19da9a95d6d6052325db6bd68593858151d609bdcb5a2b79f734",
+@@ -85,12 +85,12 @@
+     "deploy/run_shadow.sh": "cf3ae734c5a44d2e6f6560f9db682f5d19a0ed63c0416c86976492019b4f6fd9",
+     "deploy/shadow.py": "e4dd5d1ee718cded07baa9f5fc62a7244fc1a5f94a8046ab14e2b1585e05e58b",
+     "deploy/shared_navigation.py": "12be63284cf2d03493df7f5e63e09a35489ae42fcf638c9b4811124a505ae8fd",
+-    "deploy/stop_archive.py": "a998f12c45fe5a68796202cb34b7de540bc2d0858d0bd8416c3ff2d4308b8cde",
++    "deploy/stop_archive.py": "90c83f7f0798a891194d3fc1a9aaa5515be71f75f11ec7c33e598ab44392f04b",
+     "deploy/task_head_pose.json": "fe2f430b11a1bed540fb046415886082213fe231342ebd05f62a6910c44bbc6f",
+     "navigation/__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+     "navigation/amp_contract.json": "d128ef7d1c039901d80ccc6d522d83cada396970b9ee4612ff330d4c38aac76b",
+     "navigation/box_body.py": "f78e0c9bfb39355d48bf8af33c776dab70b45e7e98cb5378d3d127212fb61ffa",
+-    "navigation/box_passage.py": "4ec25f0737a2a530d281c70759625639f5bd700751b7af9f9629962ca112d5d2",
++    "navigation/box_passage.py": "0a2d1be59c93de5742a416f2ea2e5ade39cd68ecc4e4b73c3992c10e09418b4b",
+     "navigation/box_servo.py": "ef62f30db6a30999bf9585a1de5c2d35db7a98bc7f8f90ea32a9f8c79774737c",
+     "navigation/calibration.py": "42f46aded85643151027eadd3b6cbf1a8d53c446fd473787180d0bf57f072f48",
+     "navigation/command.py": "f9704718503c19da9a95d6d6052325db6bd68593858151d609bdcb5a2b79f734",
+@@ -127,7 +127,7 @@
+     "scripts/test_rt11_box_publication.py": "e90f620c0681fd43e8fdfcd8fbb34f971ad7199cbf2590fe85a3351893a20b12",
+     "scripts/test_rt11_box_visibility.py": "8e6056336d0b0faec6392750626cba0e08594ec32a184af3c45690b0801f32ac",
+     "scripts/test_rt13_entry_recovery.py": "5c676f1b7d545efe839bb6e2afeb3636e0a4950011422f8391f1d467d42155da",
+-    "scripts/test_rt13_passage.py": "af8f557e1786b2f733be1c8f6d1f1e6cd99ba93f0922415c72d19d76d7fbe09c",
++    "scripts/test_rt13_passage.py": "5abf6ceba3343b842843d754a7a0b76fd24416e4a64e05e4085e440aa159e41d",
+     "scripts/test_sensor_recovery.py": "1405a42934f58e841d0cbe4dfc48e162519bf3f31b9357b801211bc3dd5e022f",
+     "scripts/test_shared_navigation.py": "d92209f27b25d35d5987292a8d8606db5b28eeeafef237a8f252793589901444",
+     "scripts/test_single_boundary.py": "ad15b9263030f9115a2d5a212aa64f706c535daa56bc5f7765b5b5a7ead00214",
+@@ -143,7 +143,7 @@
+   "default_mode": "shadow_without_motor_publishers",
+   "real_motion_requires": "verified camera/IMU calibration, current sensors, immutable AMP identity, sole guarded publisher",
+   "nostop_policy": "Mission duration inherited from rt10; local manoeuvres may request zero velocity.",
+-  "parent_release_id": "shared_nav_20261112_rt13_10cm",
+-  "parent_manifest_sha256": "1541b1e2df6a61206e09379ecd91d5dcea8d91acd736013fb89415bb9933a08b",
+-  "validation_scope": "Local RGB-D selection tests and closed-loop MuJoCo. Hardware motion has not been tested for this candidate."
++  "parent_release_id": "shared_nav_20261112_rt13_passage",
++  "parent_manifest_sha256": "4611d49843fa0db6db0646b2d9b5c721f5828de4a3d0537b15ab47f9e9627183",
++  "validation_scope": "Recorded RGB-D passage transitions, targeted regression tests, and closed-loop simulation. The revised release has not driven on hardware."
+ }
+diff --git a/scripts/test_rt13_passage.py b/scripts/test_rt13_passage.py
+index e3127e4f22425de0af62c4b37d26a6d3b1f4ab72..78e9e43e5a277ed3ed95de0af85ec840773161ef 100644
+--- a/scripts/test_rt13_passage.py
++++ b/scripts/test_rt13_passage.py
+@@ -2,6 +2,8 @@
+ from dataclasses import replace
+ from pathlib import Path
+ import sys
++import json
++from tempfile import TemporaryDirectory
+ from types import SimpleNamespace
+ import unittest
+ 
+@@ -68,6 +70,69 @@ class PassageTests(unittest.TestCase):
+         choice.observe(1.4,[],floor,blocked,(.88,0.),FIRST_BOX_LEASE_S)
+         self.assertEqual(choice.offset,0.)
+ 
++    def test_near_crate_face_consumes_room_and_separate_returns_revoke(self):
++        from navigation.box_passage import measure_passages
++        x,y = np.meshgrid(np.linspace(-.22,.10,35),np.linspace(.116,.432,35))
++        solid = np.column_stack((np.linspace(-.08,-.01,10),np.full(10,-.115)))
++        floor = np.column_stack((x.ravel(),-y.ravel()))
++        heights = np.r_[np.zeros(len(floor)),np.full(10,.16)]
++        for edge_y, protrusion, expected in ((-.421,0.,True),(-.380,0.,False),(-.421,.06,False)):
++            points = np.vstack((floor, solid-[0.,protrusion]))
++            widths, offsets, blocked = measure_passages([Edge(edge_y,0.,-.2,.2)],points,heights,(0.,0.),-.42)
++            self.assertEqual(not blocked[0],expected)
++            self.assertEqual(offsets[0] is not None,expected)
++            if not protrusion:
++                self.assertAlmostEqual(widths[0],abs(edge_y)-.115)
++
++    def test_near_crate_crossing_stripe_needs_recent_same_outer_stripe_and_floor(self):
++        cx,cy=.55,.25
++        outer=Edge(cy-.41,0.,.39,.65)
++        inside=Edge(cy-.05,0.,.25,.46)
++        x,y=np.meshgrid(np.linspace(cx-.22,cx+.10,35),np.linspace(cy-.40,cy-.115,35))
++        xy=np.column_stack((x.ravel(),y.ravel()))
++        for edges,delta,floor,allowed in (([outer,inside],.2,True,True),([inside],.2,True,False),
++                ([outer,inside],.8,True,False),([outer,inside],.2,False,False),
++                ([Edge(outer.offset-.25*cx,.25,.39,.65),inside],.2,True,False),
++                ([outer,Edge(cy-.18,0.,.30,.60)],.2,True,False)):
++            choice=PassageChoice()
++            for t in (1.,1.2):
++                choice.observe(t,[outer],xy,np.zeros(len(xy)),(cx,cy),FIRST_BOX_LEASE_S)
++            self.assertLess(choice.offset,0.)
++            samples=xy if floor else xy[:0]
++            choice.observe(1.2+delta,edges,samples,np.zeros(len(samples)),(cx,cy),FIRST_BOX_LEASE_S)
++            self.assertEqual(choice.offset<0.,allowed)
++            if delta>.55:
++                choice.observe(1.3+delta,edges,samples,np.zeros(len(samples)),(cx,cy),FIRST_BOX_LEASE_S)
++                self.assertLess(choice.offset,0.)
++
++    def test_wait_archives_one_synchronous_rgbd_after_four_seconds(self):
++        from deploy.stop_archive import StopArchive
++        with TemporaryDirectory() as temp:
++            archive=StopArchive(Path(temp))
++            def frame(t):
++                archive.frame(SimpleNamespace(time=t,rgb=np.zeros((6,8,3),np.uint8),
++                              depth=np.full((6,8),.6)),None,{})
++            def guard(t,stamp):
++                archive.guard(dict(t=t,command=[0.,0.,0.],navigation_stamp_ns=stamp,
++                                   stop_id=2,stopped_at=1.,reason='ok',source='stopped'))
++            try:
++                frame(1.)
++                archive.decision(100,'box_passage_unconfirmed','raised_object',1.,True)
++                guard(1.,100)
++                for t in (4.,5.,5.3):
++                    frame(t)
++                    archive.decision(int(t*100),'box_passage_unconfirmed','raised_object',t,True)
++                    guard(t,int(t*100))
++            finally:
++                archive.close()
++            rows=list(map(json.loads,(Path(temp)/'stops.jsonl').read_text().splitlines()))
++            self.assertEqual([r['event'] for r in rows],['stop','stop_reason'])
++            detail=rows[-1]
++            self.assertEqual(detail['frame_timestamp_s'],5.)
++            self.assertEqual(detail['decision_frame_timestamp_s'],5.)
++            self.assertTrue((Path(temp)/detail['depth']).is_file())
++            self.assertNotEqual(detail['image'],rows[0]['image'])
++
+     def test_crossing_holds_when_current_limbs_cannot_fit_between_faces(self):
+         servo=BoxServo()
+         servo.phase='shift'

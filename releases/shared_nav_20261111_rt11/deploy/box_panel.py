@@ -13,7 +13,7 @@ from threading import Lock, Thread
 import time
 from urllib.parse import parse_qs, urlsplit
 
-from navigation.box_tuning import BoxTuning, FIELDS
+from navigation.box_tuning import BoxTuning, DEPTH_REASON_TEXT, FIELDS
 
 PORT=18761
 PAIR_FILE=Path.home()/'.config/competition_nav/rt11-panel.key'
@@ -99,6 +99,10 @@ class BoxPanel:
             control=json.loads((self.vision/'box-state.json').read_text())
         except (FileNotFoundError,ValueError):
             control={}
+        if control.get('gate') in ('depth_unobserved','depth_blocked'):
+            control['depth_explanation']=DEPTH_REASON_TEXT.get(control.get('depth_detail'))
+        elif control.get('gate') in DEPTH_REASON_TEXT:
+            control['depth_explanation']=DEPTH_REASON_TEXT[control['gate']]
         with self.lock:
             return dict(session=self.session,run=self.folder.parent.name,fields=FIELDS,defaults=self.defaults,
                         desired=self.values,revision=self.revision,control=control,

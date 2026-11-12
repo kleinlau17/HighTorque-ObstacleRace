@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "policy_name": "walk/pi_plus_amp_1110_policy_1.rknn",
+  "mode": "Soccer/normal",
+  "rl_hz": 50,
+  "pd_hz": 1000,
+  "alpha": 0.3,
+  "scale": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "lower": [
+    -0.8,
+    -0.5,
+    -1.57
+  ],
+  "upper": [
+    0.8,
+    0.5,
+    1.57
+  ],
+  "deadband": [
+    0.08,
+    0.08,
+    0.17
+  ],
+  "sha256": {
+    "amp.yaml": "a31a6dd7b9b77aca9d73f93f812897cb64cdb7f97217bda11d61b4a0c85ed10b",
+    "amp.trt": "49a64fc175dc9719554e246d42e2ccc0fa4dda97f672a66076a9e02dd8b97c13",
+    "pd.yaml": "fa0f04a3b49d72ac0825a6cfeb523e34ecf1aa68477bd49e8042d3256c7b11a0"
+  },
+  "controller_binary_sha256": "e17157bc2ade8a0342b18aad74979e37df1a22c97d169f7ed77416c67f27985d"
+}

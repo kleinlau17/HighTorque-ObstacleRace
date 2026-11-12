@@ -280,14 +280,42 @@ uv pip install --python .venv/bin/python -r requirements-sim.txt
 
 ## RT11 箱区仿真
 
-`releases/shared_nav_20261111_rt11/` 保存 2026-11-11 20:17（北京时间）发布记录对应的设备源码、配置和策略。目录内的 `release_manifest.json` 给出 88 个文件的 SHA-256。仿真读取这个目录中的控制器，由 MuJoCo 生成新的 RGB-D 观测。`reference/rt11_sim/` 保存 RT10 实机记录 20261111_094517Z_ac10347e 的时序字段和相机配置。
+本地候选位于 `releases/shared_nav_20261111_rt11/`，基于 2026-11-11 20:17 的设备版本。每次仿真都从该目录复制控制器并记录源码哈希。MuJoCo 生成每一帧 RGB-D、IMU 和关节观测，使用 RT10 真机记录的相机、规划和速度发布时间间隔。裁判按机器人全身越过每个箱子的时刻记分。
 
-使用 Python 3.11 和 `requirements-shared-sim.txt` 中的依赖，从仓库根目录运行。每次运行请给 `--out` 指定一个新目录。
+从仓库根目录运行。macOS 使用 Python 3.11 环境中的 `mjpython` 打开实时三维窗口，右侧同步显示机载彩色图和深度图。
 
 ```sh
-python scripts/generate_field.py --bend-profile corner
-python scripts/rt11_sim/run_validation.py boxes_center \
-  --source releases/shared_nav_20261111_rt11 --out output/sim/rt11_boxes_center
+.venv-shared/bin/mjpython scripts/rt11_sim/run_validation.py full_01 \
+  --source releases/shared_nav_20261111_rt11 --gui --hold \
+  --out "output/sim/rt11_$(date +%Y%m%d_%H%M%S)"
 ```
 
-`boxes_oblique` 用于斜向进入箱区，`full_01` 从起点运行整圈。`summary.json` 记录终止原因和已通过的箱子，`camera_rgbd.zip` 保存模拟相机帧。
+`full_01` 从标准起点跑整圈。`boxes_center` 和 `boxes_oblique` 分别从箱区前方正向、斜向起步。无窗口验证可用同一环境的 `python` 并去掉 `--gui --hold`。新环境需先安装 `requirements-shared-sim.txt` 并运行 `python scripts/generate_field.py --bend-profile corner` 生成场地。
+
+`summary.json` 记录全身过箱、碰撞和终止原因。`step_audit.json` 记录箱区实际发出的每步指令、零速回执、新相机帧以及白漆或深度的确认时间。`states.npz` 和 `camera_rgbd.zip` 可按原速同步回放。
+
+```sh
+.venv-shared/bin/mjpython scripts/rt11_sim/replay.py output/deployment/rt11_boundary_20261111/validated_full_01
+```
+
+回放窗口中按 `B` 跳到箱区、`P` 暂停或继续、`J` 和 `L` 前后跳 2 秒、`R` 回到起点。
+
+本次使用同一份 RT11 控制器、0.22 m/s 的巡线设置。相机、关节与 IMU 使用噪声种子 1。三个启动场景均按全身接触和边界裁判计分。
+
+| 起步方式 | 完成时间 | 箱区实际动作（横移 / 前进 / 转向） | 结果 |
+| --- | ---: | ---: | --- |
+| 标准整圈 `full_01` | 110.16 s | 31 / 19 / 2 | 依次越过三箱，接回巡线、走出小弯并完成一圈 |
+| 正向箱前 `boxes_center` | 60.16 s | 31 / 20 / 1 | 越过三箱并驶出小弯 |
+| 斜向箱前 `boxes_oblique` | 49.86 s | 28 / 15 / 1 | 越过三箱并驶出小弯 |
+
+原始记录在 `output/deployment/rt11_boundary_20261111/validated_*`。标准整圈的三次全身过箱分别发生在 67.82、78.36、88.14 秒。三个场景的动作记录都确认了相邻两步之间实际下发零速、有停后的新帧，每次横移前看到了目标白漆，每次前进前有深度通行证据。整圈结束按裁判的几何过线计分，本轮未验证视觉终点停机。
+
+额外用种子 2 跑同一标准整圈时，69.96 秒右腕碰到第二箱；详情见 `check_noise2/summary.json`。另外在首个横移期间注入 4 秒失线，最后一次非零请求在故障开始后约 0.10 秒，1 秒后下发的速度始终为零。以上为 11 月 12 日首次上机前的仿真记录。
+
+11 月 12 日 11:38，RT11 真机发布目录更新了偏蓝白线识别。对现场运行 `20261112_032403Z_821e59d1` 的停步画面重算，卡住阶段可与 IMU 和遥测对齐的 60 组 RGB-D 中，旧版在 0 组确认目标白线，新版在 48 组确认。5 对满足时间间隔的画面都使新版给出下一小步横移。修复版重新通过上表三个标准仿真场景，真机安装时通过 29 项 RT11 测试与 8 项白线测试。回放与发布记录在 `output/deployment/rt11_tape_20261112/`。
+
+11 月 12 日 11:52，RT11 更新了手脚位置与相机采集时间的匹配，并加强了近处浅蓝胶带的识别。现场运行 `20261112_033928Z_2c2bfcdf` 已进入第一箱沿线前进阶段，实际发出两次短前进，之后持续等待深度净空。使用第 13、14 次停车参考图离线重算，两帧均确认了 6.3 cm，中央深度缺失时均停车。当时未记录逐帧全身关节角，回放分别采用仿真步态包络和事后实测静止姿态。新版本再次通过上表三个标准闭环场景，机上通过 35 项 RT11 与 8 项白线测试。现场回放、仿真与部署回执在 `output/deployment/rt11_forward_20261112/`。
+
+11 月 12 日 12:08，RT11 更新了第一箱前的横移重试。现场运行 `20261112_035448Z_419c9766` 中，底层收到约 0.14 秒右移，找线转身后连续 69 帧都在等待第一次位移证明。使用同一段现场遥测在 Jetson 离线重放，新控制器于 14.10 秒根据停步后的新观测给出一次右移。在继续输入静止测量的情况下，后续不再横移。三个标准仿真均过三箱并驶出小弯，额外整圈噪声种子 2 仍在第二箱发生右腕接触。真机安装通过 37 项 RT11 测试和 8 项白线测试，记录在 `output/deployment/rt11_lateral_20261112/`。
+
+11 月 12 日 12:27，RT11 更新了箱区横移和前进。每步收步后用新画面决定方向，上一脚几乎没动时延长下一次同向指令。用 035448 的 17.66 秒停车记录在 Jetson 上离线回放，控制器发出 16 次横移，单步有效指令时长中位数 0.34 秒。白线对齐、前方有净空且机身位置固定的对照回放发出 15 次前进。正入和斜入三箱仿真均驶出小弯，标准整圈 110.16 秒完成。更换噪声种子后，第二箱仍有右腕接触。机上 50 项 RT11 测试和 8 项白线测试通过，安装后尚未进行现场试跑。[仿真与回放记录](output/deployment/rt11_continuing_20261112/validation.json) [真机安装记录](output/deployment/rt11_continuing_20261112/on_robot/robot_publish.json)
