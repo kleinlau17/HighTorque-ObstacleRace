@@ -1,0 +1,81 @@
+diff --git a/navigation/visual.py b/navigation/visual.py
+index 11bcf0e7c06af9bc87ead4cd0a47613771764fa4..37cb09dcd55b403226580dd34f0a48b88fb93d6f 100644
+--- a/navigation/visual.py
++++ b/navigation/visual.py
+@@ -551,7 +551,7 @@ class CameraPerception:
+         in_path = (y>np.minimum(center, 0.)-.30) & (y<np.maximum(center, 0.)+.30)
+         # A turn sweeps the wrist beyond the straight-ahead body width.
+         in_path |= abs(y)<.33
+-        raised = finite & (height>.06) & (height<.65) & (x>.22) & (x<1.15) & in_path
++        raised = finite & (height>.10) & (height<.65) & (x>.22) & (x<1.15) & in_path
+         supported = cv2.erode(raised.astype(np.uint8), np.ones((2, 2), np.uint8))
+         if cv2.countNonZero(supported):
+             # Keep an actual return per 4 cm cell, in gravity-aligned AHRS axes.
+diff --git a/release_manifest.json b/release_manifest.json
+index af800b1de1b25ee2c6114008ac0403ddb25a6caa..b11ef420501a1a3322a30f1d80b433cc99daf4ce 100644
+--- a/release_manifest.json
++++ b/release_manifest.json
+@@ -1,5 +1,5 @@
+ {
+-  "release_id": "shared_nav_20261111_rt13",
++  "release_id": "shared_nav_20261112_rt13_10cm",
+   "python": ">=3.8",
+   "navigation_core_sha256": {
+     "__init__.py": "5116b22a589575c6b9f55158ece82507574c441351a8d7e32ca1d964f8107380",
+@@ -18,7 +18,7 @@
+     "release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+     "runtime.py": "ec984e621b250676ab3f999fbc78c41d1ce08d785e42bcd3ba77000c50238d6b",
+     "surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+-    "visual.py": "41e48d71cb66716237b9af8d7578408f0dd4ee931e2184045caf087fcab22428"
++    "visual.py": "a2e961fd26980c3de89aa5095a5815cb15153ec2693b56142036429c1d3c246e"
+   },
+   "factory_contract": {
+     "alpha": 0.3,
+@@ -101,7 +101,7 @@
+     "navigation/release.py": "ac116e4a0d232f356f5b40195648894875297523b6da850ff5ca6f9bb0a68899",
+     "navigation/runtime.py": "ec984e621b250676ab3f999fbc78c41d1ce08d785e42bcd3ba77000c50238d6b",
+     "navigation/surface_odometry.py": "b0e62674eaf9f565512c92464b305a5904c017b2e9ddf9c2de46e145fde02031",
+-    "navigation/visual.py": "41e48d71cb66716237b9af8d7578408f0dd4ee931e2184045caf087fcab22428",
++    "navigation/visual.py": "a2e961fd26980c3de89aa5095a5815cb15153ec2693b56142036429c1d3c246e",
+     "reference/robot/PiPlusPro_SF_12L8A0G2H0W_Z_261010/urdf/PiPlusPro_SF_12L8A0G2H0W_Z_261010.urdf": "5169fe5d59eae117c006232b7512a0e28347383187482c05619487f19831a69c",
+     "scripts/replay_navigation.py": "4f3a9190241efb5efe1e64e318b724f441a704f21a5f5301ae85b79d1fc4dc85",
+     "scripts/test_corridor_feedback.py": "99cda7c612c0d386ae2d8deb58fcd4f4197f2ac8150af320029b360a91f84565",
+@@ -110,7 +110,7 @@
+     "scripts/test_floor_odometry.py": "ce6bbc2ddd01b9e0650f20627bb6480ac6632b2e0330ad0ac628a28bc0668ec2",
+     "scripts/test_floor_projection.py": "1a6ad0d7eedcea9237965fc78a162ebae69ab6d1cc19d44601cd733849691a88",
+     "scripts/test_gap_controller.py": "8dd58c3838224e7a2d4b50375c71a64bd771e01b8da9f6ef27e69ea7897a2b3f",
+-    "scripts/test_ground_color_integration.py": "6d7f5f65fcd870a0b33f3f56250c9aa660dcd02a83091d0cb75027413cf024eb",
++    "scripts/test_ground_color_integration.py": "b1657d726f550a0a90a40aa503e9d47af0e3a3202ce9580534f6dd55d45d43c5",
+     "scripts/test_head_profile.py": "375c6121d496b8b62445202ee906548188d7e515c083a82622cd8072178cb16f",
+     "scripts/test_head_restore.py": "35e05a75d331b1313f423a0be2e8f367761c2915ee5bc88ae2d887aee47b39f6",
+     "scripts/test_line_supervisor.py": "00c441bb8130b11ccfdc64bde800964bc04580e2e3db90a9bb02da598b0770dc",
+@@ -138,7 +138,7 @@
+   "default_mode": "shadow_without_motor_publishers",
+   "real_motion_requires": "verified camera/IMU calibration, current sensors, immutable AMP identity, sole guarded publisher",
+   "nostop_policy": "Mission duration inherited from rt10; local manoeuvres may request zero velocity.",
+-  "parent_release_id": "shared_nav_20261111_rt11",
+-  "parent_manifest_sha256": "8cf0c5df6c9acd3f3e455d7356f816681a887a86a58e6c4ed4f8df52a3b46987",
+-  "validation_scope": "Local MuJoCo and offline telemetry. Robot motion is outside this archive's validation scope."
++  "parent_release_id": "shared_nav_20261111_rt13",
++  "parent_manifest_sha256": "147a09000875fcbe5991ca9949faa183cba83d591821077c493a332bc43a6679",
++  "validation_scope": "Local RGB-D height-boundary, perception and RT13 entry recovery unit tests."
+ }
+diff --git a/scripts/test_ground_color_integration.py b/scripts/test_ground_color_integration.py
+index d8ccc023957966da663125656d4bcba609597be5..fd2781207f497575c90d9c4ca2b685d1460139fe 100644
+--- a/scripts/test_ground_color_integration.py
++++ b/scripts/test_ground_color_integration.py
+@@ -66,6 +66,14 @@ def perspective_scene(colors, slope=(0., 0.), camera_position=CAMERA_POSITION,
+ 
+ 
+ class GroundColorIntegrationTests(unittest.TestCase):
++    def test_lane_obstacle_must_rise_above_ten_centimeters(self):
++        for height, expected in ((.099, 'clear'), (.100, 'clear'), (.101, 'raised_object')):
++            with self.subTest(height=height):
++                frame, _ = perspective_scene([[70, 70, 70]], box_dimensions=(.07, .07, height),
++                                             box_centers=[(.85, .12)])
++                _, scene = camera_perception().inspect_lane(frame, np.eye(3))
++                self.assertEqual(scene, expected)
++
+     def project(self, frame, attitude=None, pose=None):
+         attitude = np.eye(3) if attitude is None else attitude
+         pose = np.zeros(3) if pose is None else pose

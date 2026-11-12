@@ -1,0 +1,64 @@
+{
+  "lane": {
+    "exit_frames": 3,
+    "recall_frames": 3,
+    "recall_timeout_s": 3.0,
+    "recall_gain": 1.5,
+    "recall_limit": 0.25
+  },
+  "avoid": {
+    "stop_frames": 5,
+    "strafe_speed": 0.16,
+    "strafe_s": 2.5,
+    "back_speed": -0.3,
+    "back_s": 1.0,
+    "body_half": 0.38,
+    "follow_vx": 0.07,
+    "follow_ky": 1.8,
+    "follow_vy_max": 0.2,
+    "follow_kw": 2.5,
+    "follow_w_max": 0.3,
+    "approach_near": 1.0,
+    "approach_far": 1.1,
+    "follow_align_tol": 0.08,
+    "follow_side": 0.3,
+    "strafe_offset": 0.22
+  },
+  "box": {
+    "sx": 0.2,
+    "sy": 0.2,
+    "sz": 0.4,
+    "cluster_cell": 0.12,
+    "cluster_min_pts": 12,
+    "fit_step_deg": 3
+  },
+  "vision": {
+    "white_dark": 115,
+    "white_ratio": 0.25,
+    "white_x_min": 0.3,
+    "floor_band": 0.025,
+    "raised_h_min": 0.06,
+    "raised_h_max": 0.65,
+    "raised_x_min": 0.1,
+    "raised_x_max": 1.15,
+    "path_half": 0.3,
+    "path_abs": 0.33,
+    "lane_x_lo": 0.15,
+    "lane_x_hi": 1.25,
+    "lane_bins": 9,
+    "lane_gap": 0.18,
+    "pair_min": 0.26,
+    "pair_max": 1.0
+  },
+  "ground": {
+    "refit_band": 0.03,
+    "refit_rms": 0.005,
+    "recover_failures": 5,
+    "search_bins": 60,
+    "search_ms": 80
+  },
+  "perception": {
+    "scale": 0.4,
+    "lease_s": 1.0
+  }
+}

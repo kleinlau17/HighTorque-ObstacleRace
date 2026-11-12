@@ -1,12 +1,12 @@
 # RT11 真机短步测试版
 
-箱区每次只授权一个短步。侧移达到 4.6 cm 估计位移或 0.36 秒、前进达到 6.3 cm 估计位移或 0.40 秒时，控制器请求零速。收到实际发布零指令的回执后，必须使用其后采集的视觉观测判断下一步。地面打滑和步态惯性会使真机实际位移与估计值不同。箱区观测不足或无法确认上一步的位移时，任务保持零速。此版本用于现场验证，三箱整段仍在仿真中调试。
+箱区默认横移一小步最多 4.6 cm，前进一小步最多 6.3 cm。这两个数是控制器的估计值。每步结束时先发零速，再看收步后的新画面。对侧白线还偏着，就继续横移。白线对齐后向前迈步。深度相机只看不全脚边、已对齐的白线仍可见时，就沿白线前进。上一脚几乎没动时，控制器会延长下一脚同方向的指令，继续尝试。箱子或白线一时看不清时，会短暂观察，再小幅转身换个角度看。
 
 # RT11 三箱导航
 
 箱区控制从 RGB-D 的箱面和顶缘估计箱体方向与相对位置，用足底运动学和 IMU 在视觉帧之间修正前进、横移和制动指令。每个发布周期使用已完成的一帧和与之配对的控制目标。箱区观察超时或 IMU 失效会请求零速。
 
-全身越过第三只箱子后，机器人向实测车道中心回正，随后由巡线控制继续行进。本任务按一圈设计，终点行为和 300 秒任务时限继承自 rt10。当前版本已在 MuJoCo 验证。
+全身越过第三只箱子后，机器人向实测车道中心回正，随后由巡线控制继续行进。本任务按一圈设计，终点行为和 300 秒任务时限继承自 rt10。运动发布器在主动导航期间计时。连续发零速达到 1.88 秒时，它发出一次短转寻找白线。有正常巡线指令时立即接管。车辆实际移动多少还取决于步态和地面。
 
 ## 父版本记录
 
@@ -53,8 +53,8 @@
 ## 启动
 
 ```bash
-/home/nvidia/competition_nav/nav head     # 可选：恢复任务头姿
-/home/nvidia/competition_nav/nav start --speed 0.22
-/home/nvidia/competition_nav/nav status
-/home/nvidia/competition_nav/nav stop
+~/competition_nav/releases/shared_nav_20261111_rt11/deploy/nav head     # 可选：恢复任务头姿
+~/competition_nav/releases/shared_nav_20261111_rt11/deploy/nav start --speed 0.22
+~/competition_nav/releases/shared_nav_20261111_rt11/deploy/nav status
+~/competition_nav/releases/shared_nav_20261111_rt11/deploy/nav stop
 ```

@@ -19,7 +19,9 @@ class BoxPublicationTest(unittest.TestCase):
         self.imu = (.2, [0., 0., 0., 1.])
         self.frame = BoxFrame(np.zeros(2), np.zeros(2), (np.array([1., .13]),),
                               0., 1., 0., None, 0., identified=(0,), axis_evidence=(True,True), visual_xy=(0.,0.))
-        self.nav.approached=True
+        from test_rt11_box_steps import edges_at
+        self.frame=replace(self.frame,edges=edges_at(.22),previous_edges=edges_at(.22),previous_stamp=-.1,
+                           forward_room=.12,depth_status='depth_clear',progress_x=0.)
         self.nav.pending_frame = self.frame
         self.nav.commit_frame()
         self.plan = PublishedPlan(vector=self.vector, deadline=1., reason='box_enter',
@@ -40,7 +42,10 @@ class BoxPublicationTest(unittest.TestCase):
         self.assertIsNone(self.nav.target)
         new_plan = replace(self.plan, box_servo=self.nav.publication(next_frame, 1.))
         new, *_ = self.evaluate(new_plan, .2, self.imu)
-        self.assertLess(new[1], 0.)
+        np.testing.assert_equal(new,np.zeros(3))  # reversing sides first emits zero
+        self.nav.steps.published(.22,np.zeros(3))
+        self.nav.frame=replace(next_frame,stamp=.32,previous_stamp=.27)
+        self.assertLess(self.nav.command(.34,0.)[1],0.)
 
     def test_box_expiry_and_missing_imu_stop(self):
         for t, imu, reason in [(1., (.99, self.imu[1]), 'box_observation_expired'),
@@ -65,11 +70,43 @@ class BoxPublicationTest(unittest.TestCase):
             vector, *_ = self.evaluate(self.plan, .2, self.imu)
             np.testing.assert_equal(vector, np.zeros(3))
 
+    def test_weak_entrance_look_uses_measured_angle_and_original_lease(self):
+        for ending in ('angle','lease','stripe'):
+            with self.subTest(ending=ending):
+                nav=BoxServo()
+                for capture in (1.,2.,3.):
+                    frame=replace(self.frame, side=-1., stamp=capture, edges=(None,None))
+                    nav.frame=frame
+                    self.assertLess(nav.command(capture+.47,0.)[2],0.)
+                    self.assertEqual(bool(nav.steps.active.get('measured_look')),capture==3.)
+                    hook=nav.publication(frame,capture+.75)
+                    tick=capture+(.51 if capture==3. else .48)
+                    vector=hook(tick,None,self.rotation)
+                    self.assertLess(vector[2],0.)
+                    hook.published(tick,vector)
+                    if capture<3.:
+                        zero=hook(capture+.52,None,self.rotation)
+                        np.testing.assert_equal(zero,np.zeros(3))
+                        hook.published(capture+.52,zero)
+                # Even a newer frame offered with a longer lease cannot prolong this grant.
+                seen=replace(frame,stamp=3.55)
+                if ending=='stripe':
+                    seen=replace(seen,edges=(self.frame.edges[1],None))
+                nav.frame=seen
+                new_hook=nav.publication(seen,4.55)
+                if ending=='angle':
+                    yaw=-.17
+                    attitude=np.array([[np.cos(yaw),-np.sin(yaw),0.],
+                                       [np.sin(yaw),np.cos(yaw),0.],[0.,0.,1.]])
+                    command=new_hook(3.60,None,attitude)
+                else:
+                    command=new_hook(3.76 if ending=='lease' else 3.60,None,self.rotation)
+                np.testing.assert_equal(command,np.zeros(3))
+
     def test_box_step_time_limit_at_large_monotonic_origin(self):
         for origin in (17.5213, 56231.271, 3285599.063801):
             nav=BoxServo()
-            nav.approached=True
-            nav.frame=replace(self.frame,stamp=origin)
+            nav.frame=replace(self.frame,stamp=origin,previous_stamp=origin-.10)
             self.assertGreater(nav.command(origin,0.)[1],0.)
             np.testing.assert_equal(nav.command(origin+.41,0.),np.zeros(3))
             hook=nav.publication(nav.frame,origin+1.)

@@ -5,6 +5,7 @@ from threading import Lock
 from navigation.leg_odometry import ProLegOdometry
 from navigation.box_tape import BoxTape
 from navigation.box_steps import BoxSteps
+from navigation.box_corridor import BoundaryTracks, Edge, clipped_paint_pair, floor_edges, measured_pass_side, forward_clearance
 from navigation.box_tuning import BoxTuning
 from navigation.box_body import limb_points, station_window
 import cv2
@@ -71,6 +72,18 @@ class BoxFrame:
     direct_axes: tuple = ((),())
     linked: tuple = ()
     visual_xy: tuple = (None,None)
+    # Right and left boundaries are signed metric lines in the crate-heading frame.
+    edges: tuple = (None,None)
+    previous_edges: tuple = (None,None)
+    previous_stamp: float = -np.inf
+    forward_room: float = 0.
+    depth_status: str = 'depth_unobserved'
+    progress_x: object = None
+    # Fresh range to a crate side that was measured together with this stripe.
+    registered_edges: tuple = (None,None)
+    previous_registered: tuple = (None,None)
+    paint_stamp: tuple = (-np.inf,-np.inf)
+    depth_diagnostics: object = None
 
 
 class BoxServo:
@@ -87,7 +100,6 @@ class BoxServo:
         self.boxes=[]
         self.index=0
         self.phase='enter'
-        self.along_started=None
         self.side=0
         self.legs=ProLegOdometry()
         self.leg_anchor=None
@@ -96,6 +108,7 @@ class BoxServo:
         self.visible=[]
         self.done=False
         self.last_cmd=np.zeros(3)
+        self.guard_report=None
         self.target=None
         self.error=None
         self.track_mid=None
@@ -104,7 +117,13 @@ class BoxServo:
         self.stationary=0.
         self.kick_until=0.
         self.tape=BoxTape()
+        self.boundaries=BoundaryTracks()
+        self.edge_landmarks={}
+        self.edge_proof={}
+        self.paint_time=[-np.inf,-np.inf]
+        self.entry_side_measurement=None
         self.steps=BoxSteps()
+        self.previous_entrance_look=None
         self.tuning=BoxTuning()
         self.tuning_revision=0
         self.pending_tuning=None
@@ -112,22 +131,43 @@ class BoxServo:
         self.release_requested=False
         self.hold_reason='initializing'
         self.step_count=0
+        self.step_cap=None
         self.entry_station=None
+        self.entry_clearance=None
+        self.boundary_lock=None
+        self.last_aligned_line=None
+        self.aligned_box=None
         self.covisible=set()
-        self.forward_still_since=None
-        self.restart_until=0.
+        self.visual_odom_anchor=None
         self.body_sample=None
+        self.last_body_gap=-np.inf
         self.station_bounds=None
-        self.approached=False
         self.body_history=[]
+        self.observation_since=None
+        self.search_heading=None
+        self.search_direction=1.
+        self.search_pulses=0
 
-    def observe(self, frame, attitude, camera, tracked, origin_yaw, lane):
+    def observe(self, frame, attitude, camera, tracked, origin_yaw, lane, rgb_usable=None):
         yaw=np.arctan2(attitude[1,0],attitude[0,0])
         plane=camera.ground.result
         if self.done:return
         if self.frame is not None:
+            missing='no_box_geometry'
+            if not plane.valid:
+                distances=frame.depth[::4,::4]
+                missing='no_ground_plane'
+                if not np.any((distances>.12)&(distances<4.)):
+                    if rgb_usable is None:
+                        pixels=(frame.rgb.max(axis=2)>5)&(frame.rgb.min(axis=2)<250)
+                        rgb_usable=np.count_nonzero(pixels)>=frame.depth.size*.01
+                    missing='no_depth_returns' if rgb_usable else 'no_usable_rgbd'
             self.pending_frame=replace(self.frame,stamp=frame.time,identified=(),axis_evidence=(False,False),
-                                       tape_fix=False,tape_longitudinal=False,direct_axes=((),()),linked=(),visual_xy=(None,None))
+                                       tape_fix=False,tape_longitudinal=False,direct_axes=((),()),linked=(),visual_xy=(None,None),
+                                       edges=(None,None),previous_edges=(None,None),previous_stamp=-np.inf,
+                                       forward_room=0.,depth_status='depth_unobserved',progress_x=None,
+                                       registered_edges=(None,None),previous_registered=(None,None),
+                                       depth_diagnostics={'reason':missing})
         xyz=(camera.rays*frame.depth[...,None])@camera.rotation32.T+camera.position32
         level=xyz@attitude.T
         if not plane.valid:return
@@ -211,10 +251,11 @@ class BoxServo:
         rim=depth_points[rim_mask,:2]
         self.corrections=[]
         face_ids=[set(),set()]
+        face_ranges=({}, {})
         visual_xy=[None,None]
         for axis in range(2):
             surf=xy[wall&(abs(norm[...,axis])>.91)]
-            err=[]
+            face_hits=[]
             for idx,box in enumerate(self.boxes):
                 predicted=box-self.pos
                 face=predicted[axis]+np.sign(lens[axis]-predicted[axis])*.1
@@ -226,9 +267,8 @@ class BoxServo:
                 modal=np.argmax(np.bincount(bins+20))-20
                 near=vals[abs(vals-.004*modal)<.008]
                 if len(near)>=10:
-                    err.append(float(np.median(near)))
-                    face_ids[axis].add(idx)
-            if not err:
+                    face_hits.append((idx,float(np.median(near))))
+            if not face_hits:
                 # At close range the head sees the top outline after losing
                 # the front wall. A rim touching observed floor supplies an
                 # independent metric edge even during a lateral crossing.
@@ -244,8 +284,16 @@ class BoxServo:
                         peak=(np.argmax(np.bincount(bins))-20)*.003
                         on=abs(ds-peak)<.007
                         if on.sum()>=9 and np.ptp(rim[ids,1-axis][on])>.046:
-                            err.append(float(np.median(ds[on])))
-                            face_ids[axis].add(idx)
+                            face_hits.append((idx,float(np.median(ds[on]))))
+            if len(face_hits)>1 and np.ptp([delta for _,delta in face_hits])>.042:
+                # Clipped near faces sometimes match a slat on a different box.
+                # Averaging two conflicting ranges moves the station between them.
+                supported=[hit for hit in face_hits if abs(hit[1])<.022]
+                face_hits=supported if supported and np.ptp([v for _,v in supported])<.028 else []
+            err=[delta for _,delta in face_hits]
+            for idx,delta in face_hits:
+                face_ranges[axis][id(self.boxes[idx])]=self.boxes[idx][axis]-self.pos[axis]+delta
+            face_ids[axis].update(idx for idx,_ in face_hits)
             if err:
                 visual_xy[axis]=float(self.pos[axis]-np.median(err))
                 maximum,gain=(.038,.85) if axis==0 else (.018,.58)
@@ -310,7 +358,7 @@ class BoxServo:
                 self.pos[1]+=.28*tape_correction[1]
         if self.track_mid is None and len(self.boxes)>1:
             self.track_mid=(self.boxes[0][1]+self.boxes[1][1])/2
-        if not self.side or (self.index==0 and self.phase in ('enter','along')):
+        if not self.side or (self.index==0 and self.steps.count==0):
             if len(self.boxes)>1:
                 self.side=np.sign(self.boxes[1][1]-self.boxes[0][1])
             elif lane is not None:
@@ -325,13 +373,141 @@ class BoxServo:
             if self.stationary>.5:
                 self.kick_until=frame.time+.45;self.stationary=-.65
 
+        valid=np.isfinite(frame.depth)&(frame.depth>.12)&(frame.depth<4.)
+        lines=floor_edges(frame.rgb,depth_points,height,valid)
+        # Match current measurements after insertion/remapping of a nearer
+        # first crate. A pre-insertion ID would associate the wrong white edge.
+        relative={}
+        errors={}
+        for rel in measured:
+            distances=np.linalg.norm(np.asarray(self.boxes)-self.pos-rel,axis=1)
+            idx=int(np.argmin(distances))
+            if distances[idx]<min(.105,errors.get(idx,np.inf)):
+                relative[idx]=rel
+                errors[idx]=distances[idx]
+        if self.index==0 and (not self.side or self.steps.count==0):
+            if 0 in relative:
+                measured_side=measured_pass_side(lines,relative[0])
+                if measured_side:
+                    self.entry_side_measurement=(self.boxes[0],float(measured_side))
+            if self.entry_side_measurement is not None and self.entry_side_measurement[0] is self.boxes[0]:
+                self.side=self.entry_side_measurement[1]
+        anchors=[(self.side*(-1 if idx%2 else 1),rel) for idx,rel in relative.items() if self.side]
+        bounds=self.boundaries.observe(lines,frame.time,self.pos,anchors)
+        ranged={}
+        for idx,box in enumerate(self.boxes):
+            ident=id(box)
+            if ident in face_ranges[0] and ident in face_ranges[1]:
+                ranged[idx]=(face_ranges[0][ident],face_ranges[1][ident])
+        registered=self._registered_edges(frame.time,bounds,relative,depth_points,height,valid,ranged)
+        # Use a far curved stripe only as a present paint witness. Its tangent
+        # is unsuitable for projecting the body alignment back to the robot.
+        clipped=clipped_paint_pair(lines,anchors)
+        for k,edge in enumerate(bounds):
+            reference=registered[k]
+            if edge is not None or (reference and any(
+                    abs(e.at(e.near)-reference.at(e.near))<(.030 if e.near<.88 else .050) and
+                    abs(e.slope-reference.slope)<.40 and e.far-e.near>.069
+                    for e in ([clipped[k]] if clipped[k] is not None else [])+lines)):
+                self.paint_time[k]=frame.time
+        body,depth_diagnostics=self._capture_body(frame.time)
+        room,depth_status=forward_clearance(depth_points,height,valid,body,frame.depth,camera,
+                                            attitude,basis,plane,bounds,self.tuning.forward_step/100.,anchors,
+                                            diagnostics=depth_diagnostics)
+        if body is None:
+            depth_diagnostics['reason']=depth_diagnostics['body_evidence']
+        # Longitudinal motion cannot be inferred from a straight tape. Use actual
+        # range to a currently associated crate, or independently accepted visual odometry.
+        progress_x=visual_xy[0]
+        if progress_x is None and relative:
+            idx=min(relative,key=lambda j:abs(j-self.index))
+            progress_x=float(self.boxes[idx][0]-relative[idx][0])
+        if tracked.odometry.accepted:
+            if progress_x is not None:
+                self.visual_odom_anchor=(frame.time,float(odom[0]),progress_x)
+            elif self.visual_odom_anchor and 0<frame.time-self.visual_odom_anchor[0]<.6:
+                _,origin,anchor=self.visual_odom_anchor
+                progress_x=float(anchor+odom[0]-origin)
+        else:
+            self.visual_odom_anchor=None
+        prior=self.frame
+        prior_stamp=prior.stamp if prior is not None else -np.inf
+        prior_edges=prior.edges if prior is not None else (None,None)
+
         # The real publisher runs concurrently with RGB-D processing. Publish
         # a complete capture result by one reference assignment; its arrays
         # are independent of the mutable next-frame tracker.
         self.pending_frame=BoxFrame(self.pos.copy(),self.velocity.copy(),tuple(self.boxes),self.heading,
                             self.side,self.last_time,self.leg_anchor,self.kick_until,
                             tuple(sorted(identified)),(x_seen,y_seen),bool(line_err) or tape_correction is not None,bool(tape_x),
-                            tuple(tuple(sorted(v)) for v in face_ids),tuple(sorted(connected&current_reference)),tuple(visual_xy))
+                            tuple(tuple(sorted(v)) for v in face_ids),tuple(sorted(connected&current_reference)),tuple(visual_xy),
+                            tuple(bounds),prior_edges,prior_stamp,room,depth_status,progress_x,
+                            registered,prior.registered_edges if prior else (None,None),tuple(self.paint_time),
+                            depth_diagnostics)
+
+    def _registered_edges(self,stamp,bounds,relative,points,height,valid,ranged):
+        # The width of a 20 cm crate gives a bounded center from a directly
+        # measured front or roof. Reject a severely clipped outline. A side
+        # plane is independently sufficient when its normal and extent agree.
+        x,y=points[...,0],points[...,1]
+        measured={}
+        for idx,(cx,cy) in relative.items():
+            surfaces=valid & (((abs(x-(cx-.10))<.031)&(height>.05)&(height<.377)) |
+                              ((abs(x-cx)<.118)&(abs(height-.40)<.019))) & (abs(y-cy)<.125)
+            if np.count_nonzero(surfaces)<36:continue
+            lo,hi=np.percentile(y[surfaces],[1,99])
+            if .164 < hi-lo < .225:
+                measured[idx]=(cx,(hi+lo)*.5)
+                continue
+            pairs=[]
+            for sign in (-1.,1.):
+                local=surfaces & (abs(y-(cy+sign*.10))<.022) & (height<.377)
+                if local.sum()<32:continue
+                yy=y[local]
+                bins=np.rint((yy-cy-sign*.10)/.003).astype(int)+8
+                peak=cy+sign*.10+.003*(np.argmax(np.bincount(bins))-8)
+                on=local & (abs(y-peak)<.004)
+                if on.sum()>=32 and np.ptp(x[on])>.043 and np.ptp(height[on])>.065:
+                    pairs.append(np.median(y[on])-sign*.10)
+            if pairs and np.ptp(pairs)<.018:
+                measured[idx]=(cx,float(np.median(pairs)))
+        if self.index>=1:
+            for idx,rel in ranged.items():
+                measured.setdefault(idx,rel)
+        result=[]
+        for k,edge in enumerate(bounds):
+            estimates=[]
+            for idx,(cx,cy) in measured.items():
+                key=(id(self.boxes[idx]),k)
+                samples=self.edge_landmarks.setdefault(key,[])
+                if edge is not None and edge.near<.87:
+                    # Store a bounded sample history, replacing a single
+                    # contradictory extrapolation only after agreement.
+                    offset=edge.at(cx)-cy
+                    samples.append((stamp,edge.slope,offset))
+                    del samples[:-9]
+                if len(samples)<2 or not 0<=stamp-samples[-1][0]<14.:
+                    continue
+                slopes=np.array([q[1] for q in samples])
+                offsets=np.array([q[2] for q in samples])
+                agree=abs(offsets-np.median(offsets))<.020
+                if np.count_nonzero(agree)<2:continue
+                slope=np.median(slopes[agree])
+                est=np.median(offsets[agree])+cy-slope*cx
+                estimates.append((idx,est,slope))
+            # A single consistent metric ID is preferable to combining two
+            # faces with different occlusion bias. Preserve the previous ID.
+            prior=self.edge_proof.get(k)
+            estimates.sort(key=lambda v: (v[0]!=(prior[0] if prior else None),abs(v[0]-self.index),v[0]))
+            if estimates and (len(estimates)==1 or np.ptp([a[1] for a in estimates])<.055):
+                i,offset,slope=estimates[0]
+                self.edge_proof[k]=(i,stamp,float(offset),float(slope))
+                same=(prior is not None and prior[0]==i and 0<stamp-prior[1]<=.55)
+                result.append(Edge(float(offset),float(slope),0.,0.) if same else None)
+            else:
+                self.edge_proof.pop(k,None)
+                result.append(None)
+        return tuple(result)
 
     def commit_frame(self):
         if self.pending_frame is not None:
@@ -345,10 +521,54 @@ class BoxServo:
                 self.latest_leg=(t,self.legs.xy.copy(),self.legs.velocity.copy())
                 points=limb_points(positions,attitude)
                 if points is not None:
-                    self.body_history=[prev for prev in self.body_history if t-prev[0]<.22]
-                    self.body_history.append((t,points))
-                    self.body_sample=(t,np.vstack([prev[1] for prev in self.body_history]))
+                    # Keep raw poses longer than a vision cycle; the 18 Hz ROS
+                    # callback keeps running while the Jetson processes RGB-D.
+                    self.body_history=[prev for prev in self.body_history if t-prev[0]<=1.5]
+                    self.body_history.append((t,points,self.legs.xy.copy()))
+                    if self.body_sample is not None and t-self.body_sample[0]>.13:
+                        self.last_body_gap=t
+                    self.body_sample=(t,np.vstack([p for ts,p,_ in self.body_history if t-ts<.22]))
             return accepted
+
+    def _capture_body(self, stamp):
+        with self.leg_lock:
+            history=self.body_history
+            latest=self.body_sample
+            last_gap=self.last_body_gap
+        # The individual arrays are immutable and update_legs replaces the list
+        # on every update. Projection can finish without holding the ROS lock.
+        info=dict(body_capture_age_s=None,body_latest_offset_s=None,body_evidence='missing_capture_body')
+        if not history or latest is None:
+            return None,info
+        newest,live_sweep=latest
+        info['body_latest_offset_s']=float(newest-stamp)
+        before=[pose for pose in history if pose[0]<=stamp]
+        if not before:
+            return None,info
+        capture_t,_,capture_xy=before[-1]
+        info['body_capture_age_s']=float(stamp-capture_t)
+        # One normal encoder period is 56 ms. A long gap cannot describe the
+        # arms at exposure time, even if encoders are publishing again now.
+        if stamp-capture_t>.10:
+            info['body_evidence']='stale_capture_body'
+            return None,info
+        if capture_t<last_gap:
+            info['body_evidence']='interrupted_body_history'
+            return None,info
+        if newest-capture_t<.22:
+            info['body_evidence']='capture_in_live_sweep'
+            return live_sweep,info
+        between=[pose for pose in history if pose[0]>=capture_t]
+        # For a delayed image, evaluate the sweep at exposure as well as all
+        # subsequent observed poses. Translate them into the exposure frame
+        # using support-foot odometry. Include current raw reach in addition.
+        sweep=[p for ts,p,_ in before if stamp-ts<.22]
+        for _,points,xy in between[1:]:
+            moved=points.copy()
+            moved[:,:2]+=xy-capture_xy
+            sweep.append(moved)
+        info['body_evidence']='capture_and_live_sweep'
+        return np.vstack([*sweep,live_sweep]),info
 
     def command(self,t,yaw):
         with self.control_lock:
@@ -356,6 +576,12 @@ class BoxServo:
 
     def publication(self,frame,deadline):
         """Bind the box measurements and their expiry to this published plan."""
+        def retain_look_lease(move):
+            if move and move.get('measured_look') and move['frame_stamp']==frame.stamp:
+                # A replacement plan must not lengthen the authorizing capture's lease.
+                move['look_deadline']=min(move.get('look_deadline',deadline),deadline)
+                move['until']=min(move['until'],move['look_deadline'])
+
         def velocity(stamp,planned,attitude):
             if stamp>=deadline:
                 return np.zeros(3)
@@ -367,7 +593,11 @@ class BoxServo:
                 if self.frame is not frame:
                     return np.zeros(3)
                 yaw=np.arctan2(attitude[1,0],attitude[0,0])
+                move=self.steps.active
+                retain_look_lease(move)
                 guided=self._command(stamp,yaw,frame)
+                if self.steps.active is not move:
+                    retain_look_lease(self.steps.active)
                 return np.zeros(3) if guided is None else guided
             finally:
                 self.control_lock.release()
@@ -391,34 +621,47 @@ class BoxServo:
             self.tuning_revision,self.tuning=self.pending_tuning
             self.pending_tuning=None
 
+    def guard_publication(self,stamp,source):
+        # The sole motor publisher can search even while perception is waiting.
+        self.guard_report=(stamp,source)
+
     def panel_status(self, now):
         with self.control_lock:
             frame=self.frame
             fresh=(frame is not None and frame.stamp>self.invalid_projection_time and 0<=now-frame.stamp<=.50)
+            move=self.steps.active
+            moving=bool(move and move['sent'] and self.steps.last_publication_nonzero
+                        and frame is not None and frame.stamp>self.invalid_projection_time
+                        and now<move['until'] and (fresh or self.steps.completing_retry(now,frame) or
+                            (self.hold_reason=='scan_box_area' and move['frame_stamp']==frame.stamp)))
             gap=self.panel_gap
-            gate=self.hold_reason if fresh else 'no_current_geometry'
-            if fresh and self.steps.active is not None and gate in ('confirmed_path','lateral_step'):
+            gate=self.hold_reason if fresh or moving else 'no_current_geometry'
+            if (fresh or moving) and move is not None and gate in ('confirmed_path','lateral_step'):
                 gate=self.steps.reason
+            report=self.guard_report
+            if report is not None and 0<=now-report[0]<=.20 and report[1]=='navigation_recovery':
+                moving=True
+                gate='scan_box_area'
             return dict(applied=asdict(self.tuning),revision=self.tuning_revision,
                         phase=self.phase,index=self.index,done=self.done,started=bool(frame and frame.centers),
                         gate=gate,
+                        depth_detail=(frame.depth_diagnostics or {}).get('reason') if fresh else None,
                         gap=gap[1] if fresh and gap and gap[0]==frame.stamp else None,
-                        count=self.steps.count,moving=self.steps.active is not None and fresh)
+                        count=self.steps.count,moving=moving)
 
     def invalidate_projection(self, stamp):
         with self.control_lock:
             self.invalid_projection_time = max(self.invalid_projection_time, stamp)
 
     def _command(self,t,yaw,frame):
-        if frame is not None and frame.centers and not self.done and frame.stamp <= self.invalid_projection_time:
+        if frame is not None and frame.centers and not self.done and (
+                frame.stamp<=self.invalid_projection_time or yaw is None or not np.isfinite(yaw)):
+            self.hold_reason='no_current_geometry'
+            if self.steps.active is not None or frame.stamp<=self.invalid_projection_time:
+                self.steps.stop(t)
             self.last_cmd = np.zeros(3)
             return self.last_cmd.copy()
         if frame is None or not frame.centers or self.done or self.index>=len(frame.centers):return None
-        if not frame.side:
-            self.hold_reason='no_passage_side'
-            return np.zeros(3)
-        i=self.index
-        center=frame.centers[i]
         leg=self.latest_leg
         vel=frame.velocity
         if frame.leg_anchor is not None and leg is not None and 0<=t-leg[0]<=.10:
@@ -427,183 +670,408 @@ class BoxServo:
             pos=frame.position+(leg[1]-frame.leg_anchor)@basis+vel*(t-leg[0])
         else:
             pos=frame.position+frame.velocity*min(.30,max(0.,t-frame.stamp))
-        reason=self.steps.check(t,frame,pos)
+        reason=self.steps.check(t,frame,pos,self._motion_xy(frame),yaw)
         if reason:
             self.hold_reason=reason
             return np.zeros(3)
         if self.steps.active is None:
             self._adopt_tuning()
-        phase=(self.phase,self.index,self.approached)
-        vector=self._drive(t,yaw,frame,pos,vel)
+        phase=(self.phase,self.index)
+        self.step_cap=None
+        vector=self._drive(t,yaw,frame,pos,vel) if frame.side else self._hold('no_passage_side')
         if self.release_requested and self.steps.active is None:
             self.done=True
             return None
-        if phase!=(self.phase,self.index,self.approached) or self.release_requested:
+        if phase!=(self.phase,self.index) or self.release_requested:
+            self._reset_observation()
+            if self.phase=='shift' and self.entry_clearance is None and self.station_bounds is not None:
+                # Calibrate settling compensation at the first stop between crates.
+                # This is the measured remaining fore/aft margin of the limbs,
+                # in the frame of the observed boxes, after braking on approach.
+                self.entry_clearance=float(self.station_bounds[1]-frame.progress_x)
             self.steps.stop(t)
             self.hold_reason='phase_observation'
             return np.zeros(3)
         if vector is None:return None
+        vector=self._observe_when_blocked(t,frame,yaw,vector)
         local=vector[:2]@rot(yaw).T@rot(frame.heading)
         axis=1 if self.hold_reason=='lateral_step' else 0
         if np.linalg.norm(local)<.015 and abs(vector[2])>.02:axis=2
         sign=np.sign(local[axis]) if axis<2 else np.sign(vector[2])
         step_cm=self.tuning.side_step if axis==1 else self.tuning.forward_step if axis==0 else 6.3
-        vector=self.steps.apply(t,frame,pos,vector,axis,sign,step_cm/100.)
-        if self.steps.reason and self.steps.active is None and np.all(vector==0):
+        requested_motion=bool(np.any(np.abs(vector)>1.e-5))
+        distance=step_cm/100.
+        if axis==0 and frame.depth_status=='depth_limited':
+            distance=min(distance,frame.forward_room-.015)
+        if axis==0 and self.step_cap is not None:
+            distance=min(distance,self.step_cap)
+        soft_range=self.hold_reason=='line_follow_unseen_path' and self.step_cap is not None
+        previous_count=self.steps.count
+        vector=self.steps.apply(t,frame,pos,vector,axis,sign,distance,self._motion_xy(frame),yaw,
+                                soft_range=soft_range)
+        if self.steps.count!=previous_count:
+            previous=self.previous_entrance_look
+            self.previous_entrance_look=None
+            if (axis==2 and self.phase=='enter' and self.hold_reason=='look_for_opposite_line'
+                    and frame.edges[int(self._pass_side(frame)>0)] is None):
+                move=self.steps.active
+                weak=0
+                if (previous and previous['sent'] and previous['sign']==sign
+                        and abs(wrap(yaw-previous['yaw']))<.035):
+                    weak=previous['weak_looks']+1
+                move['weak_looks']=weak
+                move['measured_look']=weak>=2
+                self.previous_entrance_look=move
+        if requested_motion and self.steps.active is None and not np.any(vector):
             self.hold_reason=self.steps.reason
         self.step_count=self.steps.count
         self.last_cmd=vector.copy()
         return vector
 
+    def _motion_xy(self,frame):
+        # Both boundaries measure the same signed lateral coordinate, even
+        # when the next box is on the other side of the lane.
+        for side in (self._pass_side(frame),-self._pass_side(frame)):
+            edge=frame.edges[int(side>0)]
+            if edge is not None:
+                return (frame.progress_x,side*.25-edge.offset/np.hypot(1.,edge.slope))
+        if self.phase in ('along','shift','lane_entry'):
+            side=self._pass_side(frame)
+            edge=frame.registered_edges[int(side>0)]
+            if edge is not None:
+                return (frame.progress_x,side*.25-edge.offset/np.hypot(1.,edge.slope))
+        return (frame.progress_x,None)
+
+    def recovery_direction(self):
+        # Prefer the established search or the known open side of this crate.
+        if self.search_heading is not None:
+            return self.search_direction
+        return self._pass_side(self.frame) if self.frame is not None else 0.
+
+    def _pass_side(self,frame):
+        index=self.index+(self.phase=='shift')
+        return frame.side*(-1 if index%2 else 1)
+
+    def _hold(self,reason):
+        self.hold_reason=reason
+        return np.zeros(3)
+
+    def _reset_observation(self):
+        self.observation_since=None
+        self.search_heading=None
+
+    def _observe_when_blocked(self,t,frame,yaw,vector):
+        # Keep the ordinary line/depth decision first, including immediate
+        # braking if a formerly valid translation loses its evidence.
+        if np.any(vector):
+            # A newly measured box gives a specific direction to look for the
+            # stripe. Give that turn the same priority as a verified step.
+            self._reset_observation()
+            return vector
+        move=self.steps.active
+        completing=(move is not None and move['axis']==2 and move['frame_stamp']==frame.stamp and t<move['until'])
+        if t<frame.stamp or (t-frame.stamp>.50 and not completing):
+            return self._hold('no_current_geometry')
+        if (frame.depth_diagnostics or {}).get('reason')=='no_usable_rgbd':
+            self.observation_since=None
+            return self._hold('no_current_geometry')
+        if self.search_heading is None:
+            if self.observation_since is None:
+                self.observation_since=frame.stamp
+            if frame.stamp-self.observation_since<.90:
+                return vector
+            self.search_heading=yaw
+            self.search_pulses=0
+            toward_axis=wrap(frame.heading-yaw)
+            self.search_direction=(np.sign(toward_axis) if abs(toward_axis)>.10 else
+                                   self._pass_side(frame) or 1.)
+        # The IMU limit is relative to the start of this search, including
+        # across repeated pulses and +/-pi wraparound. Each individual turn
+        # also goes through BoxSteps' actual-zero and post-stop capture gate.
+        offset=wrap(yaw-self.search_heading)
+        if self.search_direction*offset>=.25:
+            self.search_direction*=-1.
+            self.search_pulses=0
+        if move is not None:
+            if move['axis']!=2:
+                return vector
+            if move['sign']!=self.search_direction or abs(wrap(yaw-move['yaw']))>=.15:
+                return self._hold('observe_after_turn')
+        elif self.steps.zero_stamp is not None and frame.stamp-self.steps.zero_stamp<.22:
+            return self._hold('observe_after_turn')
+        else:
+            # A planted gait can unwind most of a turn while settling. Explore
+            # the other side too even if repeated pulses never reach the limit.
+            if self.search_pulses>=3 and self.search_direction*offset>-.25:
+                self.search_direction*=-1.
+                self.search_pulses=0
+            self.search_pulses+=1
+        self.hold_reason='scan_box_area'
+        return np.array([0.,0.,self.search_direction*.80])
+
+    def _look_for_edge(self,frame,yaw,pos):
+        # Only rotate while the camera still sees a box. Aim at the empty-side
+        # tape ahead of the body; never authorize translation from this estimate.
+        if not frame.identified and not frame.linked:
+            return self._hold('wait_opposite_line')
+        side=self._pass_side(frame)
+        idx=self.index+(self.phase=='shift')
+        if idx>=len(frame.centers):
+            return self._hold('wait_next_box')
+        lateral=frame.centers[idx][1]-pos[1]+side*.40
+        look_yaw=frame.heading+np.clip(np.arctan2(lateral,.70),-.46,.46)
+        error=wrap(look_yaw-yaw)
+        if abs(error)<.09:
+            return self._hold('wait_opposite_line')
+        self.hold_reason='look_for_opposite_line'
+        return np.array([0.,0.,np.copysign(.80,error)])
+
     def _drive(self,t,yaw,frame,pos,vel):
+        # A slow capture can still complete the repeat it authorized. It
+        # cannot authorize another step after the robot stops.
+        move=self.steps.active
+        if move and move.get('measured_look'):
+            # Two same-direction looks gained less than two degrees each.
+            # Finish this look on IMU feedback while its original capture owns it.
+            if frame.edges[int(self._pass_side(frame)>0)] is not None:
+                return self._hold('observe_after_turn')
+            if (frame.identified or frame.linked) and frame.stamp<=t<move.get('look_deadline',move['frame_stamp']+.50):
+                self.hold_reason='look_for_opposite_line'
+                return np.array([0.,0.,move['sign']*.80])
+        if not 0<=t-frame.stamp<=.50 and not self.steps.completing_retry(t,frame):
+            return self._hold('no_current_geometry')
         i=self.index
-        center=frame.centers[i]
-        side=frame.side*(-1 if i%2 else 1)
-        entry_gap=self.tuning.first_gap/100. if i==0 else .39
-        pass_offset=round(entry_gap+.03,4)
-        y=center[1]+side*pass_offset
-        x_seen,y_seen=frame.axis_evidence
-        box_anchor=bool(frame.identified) or (x_seen and y_seen)
-        tape_anchor=frame.tape_fix and frame.tape_longitudinal
-        if self.phase=='enter':
-            direct=(i in frame.identified) or (i in frame.direct_axes[0] and (i in frame.direct_axes[1] or frame.tape_fix))
-            evidence=direct or (bool(frame.linked) and x_seen and (y_seen or frame.tape_fix))
-        else:
-            evidence=(box_anchor and (y_seen or frame.tape_fix or bool(frame.identified))) or tape_anchor
-        if not evidence or t-frame.stamp>.50:
-            self.hold_reason='no_current_geometry'
-            self.last_cmd=np.zeros(3)
-            return self.last_cmd.copy()
-        self.panel_gap=None
-        if frame.visual_xy[1] is not None:
-            side_gap=min(side*(pos[1]-center[1]),side*(frame.visual_xy[1]-center[1]))
-            self.panel_gap=(frame.stamp,float(side_gap*100.))
-        if self.phase=='enter' and not self.approached:
-            measured_x=frame.visual_xy[0]
-            if measured_x is None:
-                self.hold_reason='wait_range'
-                return np.zeros(3)
-            # Stop before the near face while both feet and hands still
-            # have room to settle. At this distance the head can see the
-            # lateral face while the body aligns with the crate corridor.
-            clearance=center[0]-max(pos[0],measured_x)-.10
-            angle=wrap(frame.heading-yaw)
-            if clearance>.69 or abs(angle)>.17:
-                vx=np.clip(1.8*(clearance-.65)-.55*vel[0],0.,.20)
-                if clearance<.68:vx=0.
-                body=np.array([vx,0.])@rot(frame.heading).T@rot(yaw)
-                w=np.clip(2.4*angle,-.57,.57)
-                if vx>.12 and abs(vel[0])<.045 and abs(w)<.16:w=.23
-                self.hold_reason='observe_first_from_standoff'
-                self.last_cmd=np.r_[body,w]
-                return self.last_cmd.copy()
-            self.approached=True
-            self.last_cmd=np.zeros(3)
-            return self.last_cmd.copy()
-        side_gap=side*(pos[1]-center[1])
-        if frame.visual_xy[1] is not None:
-            side_gap=min(side_gap,side*(frame.visual_xy[1]-center[1]))
-        lateral_step=self.phase in ('shift','lane_entry') or (self.phase=='enter' and side_gap<entry_gap)
-        if lateral_step:
-            if self.steps.active is None:self.entry_station=float(pos[0])
-        elif self.phase in ('along','enter') and (frame.visual_xy[1] is None or side_gap<round(entry_gap-.03,4)):
-            self.hold_reason='lateral_clearance'
-            self.last_cmd=np.zeros(3)
-            return self.last_cmd.copy()
-        self.hold_reason='lateral_step' if lateral_step else 'confirmed_path'
-        if i+1<len(frame.centers):
-            gate=(center[0]+frame.centers[i+1][0])/2-.037
-        else:
-            gate=center[0]+.38
-        if self.phase=='enter':
-            target_x=self.entry_station if lateral_step else center[0]-.36
-        elif self.phase=='along':
-            target_x=gate
-        elif self.phase=='lane_entry':
-            target_x=gate+.04
-            y=.5*(frame.centers[-2][1]+frame.centers[-1][1])
-        else:
-            y=frame.centers[i+1][1]-side*.42
-            # As the torso moves across the lane, the trailing outside foot
-            # approaches the previous crate. Advance through the midpoint
-            # gradually after the leading arm has crossed the next crate.
-            total=abs(y-(center[1]+side*pass_offset))
-            fraction=np.clip(1.-abs(y-pos[1])/total,0.,1.)
-            target_x=gate+.079*np.clip((fraction-.25)/.54,0.,1.)
+        has_next=i+1<len(frame.centers)
+        gate=None
+        if self.phase=='along':
+            center=frame.centers[i]
+            gate=(center[0]+frame.centers[i+1][0])/2-.060 if has_next else center[0]+.38
             body=self.body_sample
-            if body is not None and 0<=t-body[0]<=.12:
-                lo,hi=station_window(body[1],rot(frame.heading),pos,y,center,frame.centers[i+1])
-                self.station_bounds=(float(np.clip(lo,-10.,10.)),float(np.clip(hi,-10.,10.)))
-                if np.isfinite(lo) and np.isfinite(hi):
-                    target_x=.5*(lo+hi)
-                else:
-                    target_x=np.clip(target_x,lo+.023,hi-.028)
-        dx=target_x-pos[0];lateral=y-pos[1]
-        vx0,vy0=vel
-        ahead=dx-.55*vx0
-        across=lateral-.33*vy0
-        vx=np.clip(1.7*ahead,-.18,self.tuning.forward_speed/100.)
-        side_limit=self.tuning.side_speed/100.
-        vy=np.clip(2.3*across,-side_limit,side_limit)
-        if lateral_step:
-            if abs(lateral)>.028 and vy*lateral>=0 and abs(vy)<.19:
-                vy=np.copysign(min(.19,side_limit),lateral)
-            vx=np.clip(3*(dx-.39*vx0)-.088*min(1.,abs(vy)/.15),-.20,.13)
-        elif abs(ahead)<.020:vx=0.
-        if self.phase=='along' and abs(vy)<.035 and 0.<vx<.15 and dx<.12:
-            # The stock velocity adapter otherwise rounds every positive
-            # straight request up to .20. Govern the final pulse explicitly.
-            elapsed_us=round((t-self.along_started)*1_000_000)
-            pulse_on=elapsed_us%300_000<105_000
-            vx=.20 if dx>.055 and ahead>.045 and pulse_on else 0.
-        self.target=[float(target_x),float(y)];self.error=[float(dx),float(lateral)]
-        prior_phase=self.phase
-        if prior_phase=='enter' and not lateral_step and abs(lateral)<.035 and dx<.065:
-            self.phase='along'
-            self.along_started=t
-        elif (prior_phase=='along' and abs(dx)<.052 and abs(vx0)<.09 and
-              frame.visual_xy[0] is not None and abs(target_x-frame.visual_xy[0])<.064):
-            if i+1<len(frame.centers):self.phase='shift'
-            elif len(frame.centers)>=3:
-                self.phase='lane_entry'
-        elif (prior_phase=='shift' and abs(lateral)<.035 and abs(vy0)<.11 and
-              frame.visual_xy[1] is not None and abs(y-frame.visual_xy[1])<.060):
-            self.phase='along'
-            self.along_started=t
-            self.index+=1
-        elif prior_phase=='lane_entry' and abs(lateral)<.04 and abs(vy0)<.10 and pos[0]>center[0]+.30:
-            self.release_requested=True
-            return np.zeros(3)
-        if self.phase!=prior_phase:
-            self.hold_reason='phase_observation'
-            self.last_cmd=np.zeros(3)
-            return self.last_cmd.copy()
-        desired_heading=frame.heading
+            self.station_bounds=None
+            if has_next and body is not None and 0<=t-body[0]<=.22:
+                target_y=frame.centers[i+1][1]-self._pass_side(frame)*.40
+                lo,hi=station_window(body[1],rot(frame.heading),pos,target_y,center,frame.centers[i+1])
+                self.station_bounds=(float(np.clip(lo,-10,10)),float(np.clip(hi,-10,10)))
+                if lo<=hi:
+                    gate=float(np.clip(gate,lo,hi))
+            # The old stripe may disappear behind the next crate just as we
+            # reach the measured crossing station. Switching the target only
+            # stops and looks; the new stripe must authorize the first sidestep.
+            if (has_next and self.aligned_box==i and self.station_bounds is not None and
+                    frame.progress_x is not None and self.station_bounds[0]<=frame.progress_x<=self.station_bounds[1]
+                    and abs(frame.progress_x-gate)<.040 and abs(vel[0])<.11):
+                self.phase='shift'
+                self.entry_station=None
+                return self._hold('phase_observation')
+        side=self._pass_side(frame)
+        k=int(side>0)
+        blind_patch=(frame.depth_status=='depth_unobserved' and
+                     (frame.depth_diagnostics or {}).get('reason')=='unseen_swept_path')
+        line_returned=(blind_patch and self.phase=='along' and self.aligned_box==i and
+                       self.boundary_lock is not None and any(edge is not None for edge in frame.edges))
+        # A sliver can become visible during a search turn, then disappear as the
+        # turning gait settles. Finish the bounded turn before requesting zero.
+        move=self.steps.active
+        if (not line_returned and self.search_heading is None and move and move['axis']==2 and (frame.identified or frame.linked) and
+                move['yaw'] is not None and abs(wrap(yaw-move['yaw']))<.16):
+            self.hold_reason='look_for_opposite_line'
+            return np.array([0.,0.,move['sign']*.80])
+        index=self.index+(self.phase=='shift')
+        gap=self.tuning.first_gap/100. if index==0 else .39
+        # A first gap of 39 cm asks for a body centre 1 cm inside the opposite stripe.
+        inset=.25 if self.phase=='lane_entry' else .40-gap
+        key=(index,side,inset)
+        edge=frame.edges[k]
+        prior=frame.previous_edges[k]
+        obscured=edge is None
+        finishing_on_last_line=False
+        line_correction=0.
+        if obscured and self.phase in ('shift','lane_entry') and frame.registered_edges[k] and frame.previous_registered[k]:
+            # This exact stripe and this same crate were measured together.
+            # Every step still needs two current captures of the crate's side.
+            edge=frame.registered_edges[k]
+            prior=frame.previous_registered[k]
+            obscured=False
+        if obscured:
+            # After an actual opposite-stripe alignment, the next crate can hide it.
+            # The other measured boundary can maintain an existing forward pass, but
+            # never initiate alignment or authorize a lateral step.
+            if self.phase!='along' or self.boundary_lock!=key:
+                return self._look_for_edge(frame,yaw,pos)
+            if frame.edges[1-k] is not None:
+                edge=frame.edges[1-k]
+                prior=frame.previous_edges[1-k]
+                line_correction=side*.50
+            else:
+                edge=frame.registered_edges[k]
+                prior=frame.previous_registered[k]
+                last=self.last_aligned_line
+                finishing_on_last_line=(blind_patch and move is not None and move['axis']==0 and
+                                        last is not None and last[0]==key and 0<frame.stamp-last[1]<=.45)
+                if edge is None:
+                    if not finishing_on_last_line:
+                        return self._look_for_edge(frame,yaw,pos)
+                    # Finish the already-started short step across a momentary
+                    # dropout. No new grant can start from the remembered line.
+                    edge=last[2]
+                    prior=edge
+                    line_correction=last[3]
+        norm=np.hypot(1.,edge.slope)
+        offset=edge.offset/norm+line_correction
+        error=offset-side*inset
+        if index==0 and self.phase!='lane_entry':
+            self.panel_gap=(frame.stamp,float(100*(.40-side*offset)))
+        tangent=np.array([1.,edge.slope])/norm
+        normal=np.array([-tangent[1],tangent[0]])
+        # A lateral grant cannot contain a forward component along the tape.
+        transform=rot(frame.heading).T@rot(yaw)
+        angle=wrap(frame.heading+np.arctan(edge.slope)-yaw)
+        turn=float(np.clip(2.*angle,-.38,.38))
+        self.error=[None,float(error)]
+        self.target=None
+        # Establish alignment with two captures. Once locked, a newly observed
+        # aligned stripe can resume the same forward pass after a brief dropout.
+        zero=self.steps.zero_stamp
+        tolerance=.040 if self.boundary_lock==key else .025
+        current_line=frame.edges[k] is not None or (obscured and frame.edges[1-k] is not None)
+        following_line=(self.phase=='along' and self.boundary_lock==key and self.aligned_box==index
+                        and abs(error)<=tolerance and current_line and blind_patch)
+        if (prior is None or not 0<frame.stamp-frame.previous_stamp<=.55 or
+                frame.previous_stamp<=self.invalid_projection_time or
+                (zero is not None and frame.previous_stamp<=zero)):
+            if not (following_line or finishing_on_last_line):
+                return self._hold('confirm_opposite_line')
+            prior=edge
+        prior_error=prior.offset/np.hypot(1.,prior.slope)+line_correction-side*inset
+        if abs(prior_error-error)>.075 or abs(prior.slope-edge.slope)>.22:
+            return self._hold('confirm_opposite_line')
+        paint=frame.stamp if frame.edges[k] is not None else frame.paint_stamp[k]
+        saw_target=0<=frame.stamp-paint<=.50 and (zero is None or paint>zero)
+        if abs(error)>tolerance:
+            if obscured:
+                return self._look_for_edge(frame,yaw,pos)
+            self.boundary_lock=None
+            if abs(prior_error)<=tolerance or error*prior_error<0:
+                return self._hold('confirm_opposite_line')
+            if not saw_target:
+                return self._look_for_edge(frame,yaw,pos)
+            self.hold_reason='lateral_step'
+            # Hold our measured fore/aft station during the lateral gait. If
+            # the previous entrance step barely moved sideways, re-anchor at
+            # the current station before pushing sideways again.
+            if self.entry_station is None or (self.phase=='enter' and self.steps.active is None and
+                    self.steps.little_response(1,np.sign(error),side*.25-offset)):
+                self.entry_station=float(pos[0])
+            axial=float(np.clip(2.2*(self.entry_station-pos[0])-.55*vel[0]-.055,-.19,0.))
+            speed=min(self.tuning.side_speed/100.,max(.18,2.3*abs(error)))
+            lateral=np.sign(error)*speed
+            if self.phase=='shift':
+                back,front=frame.centers[self.index:self.index+2]
+                body=self.body_sample
+                if body is None or t-body[0]>.22 or frame.progress_x is None:return self._hold('wait_station_geometry')
+                before=back[1]-side*.39
+                after=front[1]+side*.39
+                ratio=np.clip((pos[1]-before)/(after-before),0.,1.)
+                lo,hi=station_window(body[1],rot(frame.heading),pos,after,back,front)
+                self.station_bounds=[float(np.clip(lo,-10,10)),float(np.clip(hi,-10,10))]
+                station=(back[0]+front[0])/2-.043+.079*np.clip((ratio-.36)/.52,0.,1.)
+                if lo<=hi:station=float(np.clip(station,lo,hi))
+                # Reserve 18 mm for settling as the leading wrist sweeps past
+                # the next box. Fade the reserve before the trailing foot exits.
+                margin=.035 if self.entry_clearance is None else self.entry_clearance
+                tight=float(np.clip((.028-margin)/.008,0.,1.))
+                reserve=float(np.clip((.063-margin)/.012,0.,1.))*(1.-tight)
+                station-=reserve*.018*np.clip((ratio-.37)/.18,0.,1.)*np.clip((1.-ratio)/.10,0.,1.)
+                lateral=np.clip(2.3*(error-.33*vel[1]),-self.tuning.side_speed/100.,self.tuning.side_speed/100.)
+                compensate=-0.012*np.clip((ratio-0.34)/0.18,0.,1.)*np.clip((1.-ratio)/.09,0.,1.)
+                axial=float(np.clip(3*(station-pos[0]-.39*vel[0])-0.115*min(1.,abs(lateral)/.15)-compensate,-.30,.06))
+                if tight>0.:
+                    # When backing up further would crowd the trailing heel, turn the
+                    # leading wrist away from the box while translating along the tape.
+                    blend=np.clip((ratio-.30)/.17,0.,1.)*np.clip((.84-ratio)/.14,0.,1.)
+                    bias=-.20*blend*tight if side>0 else 0.
+                    turn=float(np.clip((2.+1.2*tight)*wrap(angle+bias),-.38-.14*tight,.38+.14*tight))
+            return np.r_[(lateral*normal+axial*tangent)@transform,turn]
+        if abs(prior_error)>tolerance:
+            return self._hold('confirm_opposite_line')
+        if self.phase in ('enter','shift','lane_entry') and not saw_target:
+            return self._look_for_edge(frame,yaw,pos)
+        self.boundary_lock=key
+        self.aligned_box=index
+        if current_line:
+            self.last_aligned_line=(key,frame.stamp,edge,line_correction)
+        self.entry_station=None
+        if self.phase=='lane_entry':
+            gate=frame.centers[self.index][0]+.35
+            if frame.progress_x is not None and frame.progress_x>frame.centers[self.index][0]+.30:
+                self.release_requested=True
+                return self._hold('lane_exit_confirmation')
         if self.phase=='shift':
-            # Yaw toward the side just used to pass the previous crate.
-            # This draws the upcoming-side wrist back and moves the trailing
-            # foot away from the previous crate while traversing the neck.
-            desired_heading+=side*.24
-        elif self.phase=='along' and i+1<len(frame.centers):
-            desired_heading+=side*.24*np.clip(1.-max(0.,dx)/.24,0.,1.)
-        heading_error=wrap(desired_heading-yaw)
-        body=np.array([vx,vy])@rot(frame.heading).T@rot(yaw)
-        w=np.clip(2.4*heading_error,-.5,.5)
-        if t<frame.kick_until and abs(w)<.20:w=.23
-        if self.phase in ('along','enter') and not lateral_step and vx>.17 and abs(vx0)<.055:
-            if self.forward_still_since is None:self.forward_still_since=t
-            if t-self.forward_still_since>.60:
-                self.restart_until=t+.56
-                self.forward_still_since=t+.75
-        else:self.forward_still_since=None
-        if not lateral_step and t<self.restart_until and abs(w)<.21:
-            w=.24 if heading_error>=0 else -.24
-        self.last_cmd=np.r_[body,w]
-        return self.last_cmd.copy()
+            self.index+=1
+            self.phase='along'
+            return self._hold('phase_observation')
+        if self.phase=='enter':
+            self.phase='along'
+            return self._hold('phase_observation')
+        x=frame.progress_x
+        if x is None:
+            return self._hold('wait_range')
+        dx=gate-x
+        self.error=[float(dx),float(error)]
+        self.target=[float(gate),float(pos[1]+error)]
+        if dx<.040:
+            if abs(vel[0])>=.11:
+                return self._hold('phase_observation')
+            if has_next:
+                self.phase='shift'
+            elif i==2:
+                self.phase='lane_entry'
+            else:
+                return self._hold('wait_next_box')
+            return self._hold('phase_observation')
+        partial=frame.depth_status=='depth_limited' and frame.forward_room>=.035
+        follow_blind_patch=blind_patch and (current_line or finishing_on_last_line)
+        if not follow_blind_patch and (frame.depth_status not in ('depth_clear','depth_limited') or
+                (frame.forward_room+1.e-6<self.tuning.forward_step/100. and not partial)):
+            return self._hold(frame.depth_status)
+        # On a lateral-to-forward switch at the edge of the alignment
+        # tolerance, confirm with one more capture. An unchanged position on
+        # that capture is valid: place no movement requirement on this check.
+        previous=self.steps.previous
+        if previous and previous['axis']==1 and abs(error)>.025:
+            first_check=previous.setdefault('forward_check_stamp',frame.stamp)
+            if frame.stamp<=first_check:
+                return self._hold('confirm_opposite_line')
+        if frame.depth_diagnostics is not None and not follow_blind_patch:
+            live=self.body_sample
+            if live is None or not 0<=t-live[0]<=.13 or frame.stamp<self.last_body_gap:
+                return self._hold('stale_live_body')
+        # A zero-command gait coasts. Cap displacement on the lower-latency
+        # leg sample while the fresh capture still owns the target station.
+        rate=float(np.clip(frame.velocity[0],0.,.27))
+        allowance=gate-pos[0]-.40*rate-.014
+        if dx<.105 and allowance<=.022:
+            return self._hold('brake_at_station')
+        self.step_cap=max(.022,dx-.032) if dx<.10 else None
+        self.hold_reason='line_follow_unseen_path' if follow_blind_patch else 'confirmed_path'
+        speed=min(self.tuning.forward_speed/100.,max(.22,1.65*dx))
+        if follow_blind_patch and dx<.45:
+            self.step_cap=min(self.step_cap or self.tuning.forward_step/100.,.030)
+            speed=min(speed,.18)
+        return np.r_[(speed*tangent)@transform,turn]
 
     def diagnostic(self):
+        depth=(self.frame.depth_diagnostics if self.frame is not None and
+               self.frame.stamp>self.invalid_projection_time else None)
         return dict(crate_phase=self.phase,crate_index=self.index,crate_side=float(self.side),
-                    crate_gate=self.hold_reason,crate_steps=self.step_count,
+                    crate_gate=self.hold_reason,crate_steps=self.step_count,crate_entry_clearance=self.entry_clearance,
+                    crate_step_retry=bool(self.steps.active and self.steps.active['retry']),
+                    crate_paint=[v if np.isfinite(v) else None for v in self.paint_time],crate_boundary_lock=self.boundary_lock,
+                    crate_boundary_offsets=None if self.frame is None else [None if e is None else e.offset for e in self.frame.edges],
+                    crate_forward_depth=None if self.frame is None else self.frame.depth_status,
+                    crate_depth_detail=(depth or {}).get('reason'),crate_depth_diagnostics=depth,
+                    crate_forward_room=None if self.frame is None else self.frame.forward_room,
+                    crate_progress_x=None if self.frame is None else self.frame.progress_x,
                     crate_evidence=None if self.frame is None else [self.frame.identified,self.frame.axis_evidence,self.frame.tape_fix,self.frame.tape_longitudinal],
                     crate_visual_xy=None if self.frame is None else self.frame.visual_xy,
                     crate_station_bounds=self.station_bounds,crate_zero_stamp=self.steps.zero_stamp,

@@ -12,15 +12,27 @@
 <div id="fields"></div><div class="actions"><button id="reset" disabled>恢复默认值</button><button id="apply" class="primary" disabled>应用到下一步</button></div>
 <p class="editing" id="message" role="status">正在读取参数…</p><p class="note">修改仅对本次运行生效。迈步中提交的设置会等到发出零速、取得新画面后采用。</p></section>
 <aside><h2>机器人状态</h2><p class="phase" id="phase">等待连接</p><p class="status" id="action">—</p>
-<div class="metrics"><div class="between"><span>当前首箱横向距离</span><strong class="num" id="gap">—</strong></div>
+<div class="metrics"><div class="between"><span>首箱横向错开估计</span><strong class="num" id="gap">—</strong></div>
 <div class="between"><span>首箱放行门槛</span><strong class="num" id="target">—</strong></div>
 <div class="between"><span>已下达步数</span><strong class="num" id="count">—</strong></div></div>
-<p class="detail">横向距离按机器人中心到箱子中心计算。</p></aside></div><footer><span id="run">—</span><span id="version"></span></footer>
+<p class="detail">用对侧白线估计横向错开距离。短步前进还需深度相机确认前方空间。</p></aside></div><footer><span id="run">—</span><span id="version"></span></footer>
 </main>
 <script>
 'use strict';
 const id=s=>document.getElementById(s),token=location.hash.slice(1);
-const labels={no_current_geometry:'看不清，等待新画面',initializing:'等待箱区观测',no_passage_side:'等待确认绕行方向',wait_range:'等待测出箱距',observe_first_from_standoff:'靠近并对准首箱',await_zero_publication:'等待零速指令发出',wait_post_step_capture:'等待停步后的新画面',lateral_step:'小步横移',short_side_step:'小步横移',short_forward_step:'小步前进',short_turn:'小幅调整朝向',confirmed_path:'已确认通道',lateral_clearance:'横向距离不足',wait_visual_displacement:'等待画面确认上一步位移',missing_step_measurement:'等待测出移动距离',phase_observation:'停步，重新确认箱位',direction_change:'停步，准备换方向'};
+const labels={
+ line_follow_unseen_path:'白线已对齐，沿线迈步',
+ scan_box_area:'转一点，换个角度看箱子和白线',observe_after_turn:'转身后停一下，看新画面',
+ wait_opposite_line:'观察绕行侧的白线',look_for_opposite_line:'转向绕行侧，寻找对侧白线',confirm_opposite_line:'用下一张画面确认白线位置',
+ brake_at_station:'接近两箱之间，正在收步',wait_station_geometry:'确认两箱之间的空隙和手脚位置',
+ depth_limited:'复查前面还够走多远',depth_blocked:'前方有障碍，重新观察',depth_unobserved:'测量下一步的空间',
+ wait_next_box:'观察下一箱的位置',lane_exit_confirmation:'确认已越过第三箱',no_current_geometry:'获取新的箱区画面',
+ initializing:'等待进入箱区',no_passage_side:'辨认该从哪一侧绕行',wait_range:'测量到箱子的距离',
+ observe_first_from_standoff:'靠近并对准首箱',await_zero_publication:'收步',wait_post_step_capture:'观察收步后的新画面',
+ lateral_step:'向白线横移一步',short_side_step:'向白线横移一步',short_forward_step:'沿已看清的通道前进一步',
+ short_turn:'小幅调整朝向',confirmed_path:'沿已看清的通道前进',lateral_clearance:'测量横向间隔',
+ missing_step_measurement:'重新测量这一步的起点',phase_observation:'确认下一步的方向',direction_change:'收步换方向'
+};
 const phases={enter:'进入箱区',along:'沿箱前进',shift:'箱间换侧',lane_entry:'返回车道'};
 const edited=new Set(),widgets={},headers={Authorization:'Bearer '+token};
 let state=null,dirty=false,base=0,busy=false,generation=0,timer,connected=false,polling=false;
@@ -56,8 +68,8 @@ function draw(s){
  if(!dirty&&!busy)say(s.stale?'等待导航控制器反馈':pending?'已提交，等待下一步生效':c.applied?'当前设置已生效':'等待导航控制器就绪');
  const valid=!!c.timestamp&&!s.stale;
  id('phase').textContent=valid?(c.done?'已离开箱区':c.started?'第 '+(c.index+1)+' 箱 · '+(phases[c.phase]||c.phase):'巡线中'):'等待导航反馈';
- id('action').textContent=!valid?'暂无实时观测':c.done?'已接回巡线':!c.started?'等待进入箱区':(labels[c.gate]||c.gate||'等待确认');
- id('gap').textContent=valid&&c.started&&!c.done&&c.index===0&&c.phase==='enter'&&c.gap!=null?c.gap.toFixed(1)+' cm':'—';
+ id('action').textContent=!valid?'暂无实时观测':c.done?'已接回巡线':!c.started?'等待进入箱区':(c.depth_explanation||labels[c.gate]||c.gate||'等待确认');
+ id('gap').textContent=valid&&c.started&&!c.done&&c.index===0&&c.phase!=='shift'&&c.gap!=null?c.gap.toFixed(1)+' cm':'—';
  id('target').textContent=active.first_gap+' cm';id('count').textContent=valid?c.count:'—';
 }
 async function refresh(){

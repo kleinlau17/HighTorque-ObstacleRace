@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from navigation.box_tuning import BoxTuning, FIELDS
+from navigation.box_tuning import BoxTuning, DEPTH_REASON_TEXT, FIELDS
 
 CONTROL_LOCK = Path('/tmp/competition_navigation_control.lock')
 CLI_LOCK = Path('/tmp/competition_navigation_cli.lock')
@@ -28,6 +28,16 @@ REASON_TEXT = {
     'turn_direction_mismatch': '测得的偏航方向与指令相反',
     'turn_stalled': '已发转向指令，未测得足够转动',
     'motion_stalled': '已发移动指令，未测得足够位移',
+    'line_follow_unseen_path': '白线已对齐，沿线迈步',
+    'turn_to_recover_lane': '收住前进，转身寻找出口白线',
+    'follow_recovered_lane': '重新看见白线，沿线走出弯道',
+    'scan_box_area': '转一点，换个角度看箱子和白线',
+    'observe_after_turn': '转身后停一下，看新画面',
+    'lateral_step': '向白线横移一步',
+    'confirmed_path': '沿已看清的通道前进一步',
+    'look_for_opposite_line': '转向绕行侧，寻找对侧白线',
+    'wait_post_step_capture': '观察收步后的新画面',
+    'confirm_opposite_line': '用下一张画面确认白线位置',
 }
 
 
@@ -197,8 +207,12 @@ def follow_lap(record):
                     manual_translator_restored=report.get('manual_translator_restored'),
                     output=str(output)), ensure_ascii=False), flush=True)
                 return 0 if status=='full_lap_completed' else 2
+            box_gate = row.get('crate_gate') if (reason or '').startswith('box_') else None
+            depth_detail = (row.get('crate_depth_detail') if box_gate in ('depth_unobserved','depth_blocked')
+                            else box_gate if box_gate in DEPTH_REASON_TEXT else None)
             fields = dict(vision=reason, scene=row.get('scene'), lane=row.get('lane_basis'),
                           mode=row.get('mode'), gap=row.get('gap_phase'),
+                          box_gate=box_gate, depth_detail=depth_detail,
                           guard=guard.get('source'), guard_reason=guard.get('reason'),
                           vision_stale=vision_age is not None and vision_age>3.,
                           guard_stale=guard_age is not None and guard_age>3.)
@@ -206,7 +220,7 @@ def follow_lap(record):
             if changed!=signature or last_print is None or now-last_print>=5.:
                 print(json.dumps(dict(event='progress', elapsed_s=round(now-start, 1),
                     requested=row.get('desired_velocity'), command=guard.get('command'),
-                    vision_age_s=vision_age, guard_age_s=guard_age, detail=REASON_TEXT.get(reason),
+                    vision_age_s=vision_age, guard_age_s=guard_age, detail=DEPTH_REASON_TEXT.get(depth_detail) or REASON_TEXT.get(box_gate) or REASON_TEXT.get(reason),
                     pending_raised_cells=last_cells, **fields), ensure_ascii=False), flush=True)
                 last_print, signature = now, changed
             time.sleep(.5)

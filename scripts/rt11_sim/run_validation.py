@@ -1,6 +1,7 @@
 """Re-sense MuJoCo using the candidate release and a recorded rt10 onboard schedule."""
 from pathlib import Path
 import argparse
+from dataclasses import replace
 from collections import Counter
 import csv
 import hashlib
@@ -71,6 +72,10 @@ cases = {'full_01':[.55,-1.25,0.], 'boxes_center':[2.80,1.25,np.pi],
          'small_inside':[1.25*np.cos(angle),1.25*np.sin(angle),angle+np.pi/2],
          'small_runup':[2.8,1.25,np.pi+.14], 'sharp_entry':[1.60,-1.25,.14],
          'small_entry_offset':[1.,1.25,np.pi+.14], 'full_01_offset':[.55,-1.25,.14]}
+# Enter the large bend near the upper join, then measure the exit onto the straight.
+angle_exit=np.deg2rad(116.)
+for name in ('large_exit','large_exit_pending'):
+    cases[name]=[5.+2.25*np.cos(angle_exit),2.25*np.sin(angle_exit),angle_exit+np.pi/2]
 def source_check():
     assert release['navigation_core_sha256']==recorded_core
     loaded = {}
@@ -150,7 +155,7 @@ def run(case, gui, hold):
     spawn=cases[case]
     start=track.config['starts'][0]
     assert cases['full_01']==[*start['position'],np.deg2rad(start['yaw_degrees'])]
-    empty=case.startswith('small') or case=='sharp_entry'
+    empty=case.startswith(('small','large_exit')) or case=='sharp_entry'
     model,xml=visual_world(out,start,no_obstacles=empty,camera_profile=camera,bend_profile='corner')
     (out/'scene.xml').write_text(xml)
     robot=Robot(model,spawn,from_standby=True)
@@ -201,6 +206,15 @@ def run(case, gui, hold):
     active_plan=PublishedPlan()
     body_from_imu=np.array(config["body_from_imu"])
     pending_publications={}
+    deadline=None
+    if (OUT/'navigation/motion_deadline.py').exists():
+        from navigation.motion_deadline import MotionDeadline
+        deadline=MotionDeadline()
+    motion_start=last_motion=None
+    longest_zero=0.
+    pending_site_start=None
+    zero_publications=set()
+    box_steps=[]
     last_feedback_time=None
     prev_request=np.zeros(3)
     result='time_limit'
@@ -251,6 +265,16 @@ def run(case, gui, hold):
                     if stamp-frame.time>.2:projection=['stale_capture']
                     obs=None
                     if not projection:
+                        if (case=='large_exit_pending' and pending_site_start is None and
+                                nav.lane_time is not None and robot.pose[0]<3.90):
+                            pending_site_start=stamp
+                        if pending_site_start is not None and stamp-pending_site_start<6.:
+                            # Reproduce six seconds of unresolved map evidence at the join.
+                            # A live false hit invalidates a cell's previous clearance count.
+                            pos=nav.tracked.xy
+                            point=np.r_[pos+[0.,.9],.10]
+                            key_xy=tuple(np.floor(point[:2]/.04).astype(int))
+                            nav.unconfirmed_sites[key_xy]=(point,0,stamp)
                         obs=nav.observe(frame,orientation,imu_t,rearm_label,defer_mapping=True)
                     elif hasattr(nav,'invalidate_box_projection'):
                         nav.invalidate_box_projection(frame.time)
@@ -266,6 +290,11 @@ def run(case, gui, hold):
                     next_refinement=nav.freeze_publish_velocity() if hasattr(nav,'freeze_publish_velocity') else None
                     plan=PublishedPlan(tuple(next_vector), nav.deadline, next_pulse, nav.reason,
                                        nav.scene, nav.last_frame_time, key[1]>=0, next_refinement)
+                    if deadline is not None:
+                        side=nav.crates.recovery_direction() if nav.crates.frame is not None and not nav.crates.done else 0.
+                        if not side and nav.steering_heading is not None:
+                            side=np.sign(nav.steering_heading)
+                        plan=replace(plan,recovery_direction=side)
                     # commands[].t records the instant just before command().
                     # With an image, the measured end of computation is known.
                     if key[1] < 0:
@@ -273,7 +302,17 @@ def run(case, gui, hold):
                         desired=next_vector
                     else:
                         pending_publications[key]=plan
-                    decisions.append((stamp,nav.reason,*next_vector))
+                    rs=getattr(nav,'raised_seen',None)
+                    if rs is None or len(rs)==0:
+                        stats=(0,'','','')
+                    else:
+                        a=np.asarray(rs,dtype=float)
+                        stats=(len(a),round(float(np.median(a[:,0])),2),
+                               round(float(np.median(a[:,1])),2),round(float(np.abs(a[:,1]).max()),2))
+                    decisions.append((stamp,nav.reason,*next_vector,
+                        getattr(nav,'ride_count',None), getattr(nav,'ride_y',None),
+                        getattr(nav,'ride_side',None), getattr(nav,'ride_now',None),
+                        getattr(nav,'scene',None),*stats))
                 elif kind==3:
                     active_plan=pending_publications.pop(key)
                     desired=np.array(active_plan.vector)
@@ -298,6 +337,33 @@ def run(case, gui, hold):
                     acknowledge=getattr(active_plan.box_servo,'published',None)
                     if acknowledge is not None:
                         acknowledge(stamp,published[key])
+                        servo=nav.crates
+                        step=getattr(getattr(servo,'steps',None),'active',None)
+                        if not np.any(published[key]):
+                            zero_publications.add(stamp)
+                        elif (step is not None and hasattr(servo.frame,'paint_stamp') and
+                              (not box_steps or box_steps[-1]['number']!=servo.steps.count)):
+                            frame=servo.frame
+                            zero=servo.steps.zero_stamp
+                            paint=getattr(frame,'paint_stamp',(None,None))[int(servo._pass_side(frame)>0)]
+                            paint=float(paint) if paint is not None and np.isfinite(paint) else None
+                            axis=step['axis']
+                            issues=[]
+                            if box_steps and (zero not in zero_publications or
+                                              not box_steps[-1]['sent']<zero<frame.stamp):
+                                issues.append('missing_zero_or_new_capture')
+                            if axis==1 and (paint is None or not 0<=frame.stamp-paint<=.50 or
+                                            (zero is not None and paint<=zero)):
+                                issues.append('missing_post_stop_paint')
+                            depth=getattr(frame,'depth_status',None)
+                            line_step=(servo.hold_reason=='line_follow_unseen_path' and
+                                       (frame.depth_diagnostics or {}).get('reason')=='unseen_swept_path' and
+                                       paint is not None and 0<=frame.stamp-paint<=.50 and
+                                       (zero is None or paint>zero))
+                            if axis==0 and depth not in ('depth_clear','depth_limited') and not line_step:
+                                issues.append('missing_forward_evidence')
+                            box_steps.append(dict(number=servo.steps.count,axis=axis,sent=stamp,zero=zero,
+                                                  capture=frame.stamp,paint=paint,depth=depth,line_step=line_step,issues=issues))
                 else:
                     prev_request=published[key]
                     feedback=None
@@ -307,6 +373,18 @@ def run(case, gui, hold):
                             feedback=feedback_history[min(len(feedback_history)-1,max(0,int(ts/robot.dt)))]
                             last_feedback_time=ts
                     raw_cmd=guard.update(prev_request,feedback,True)
+                    active=active_plan.reason!='initializing'
+                    if active and motion_start is None:
+                        motion_start=stamp
+                    if deadline is not None:
+                        raw_cmd=deadline.output(stamp,raw_cmd,active,
+                            getattr(active_plan,'recovery_direction',0.))
+                        deadline.published(stamp,raw_cmd)
+                    if motion_start is not None:
+                        since=motion_start if last_motion is None else last_motion
+                        longest_zero=max(longest_zero,stamp-since)
+                        if np.any(raw_cmd):
+                            last_motion=stamp
             recorder.plan(t,active_plan.reason)
             robot.step(raw_cmd,referee.contacts)
             referee.boundary()
@@ -345,6 +423,8 @@ def run(case, gui, hold):
                 result='lap_completed';break
             if case.startswith('boxes') and len(passed_boxes)==3 and entered and x>=.08 and y<-.9:
                 result='boxes_and_small_exit';break
+            if case.startswith('large_exit') and x<=2.35 and abs(y-1.25)<.18:
+                result='large_exit_reached';break
             if case.startswith('small') and entered and x>=.08 and y<-.9:
                 result='small_exit_reached';break
             if case=='sharp_entry' and x>=4.1 and y< -1.5:
@@ -360,9 +440,9 @@ def run(case, gui, hold):
     with (out/'frames.jsonl').open('w') as f:
         for r in state_rows: f.write(json.dumps(r)+'\n')
     with (out/'decisions.csv').open('w') as f:
-        w=csv.writer(f); w.writerow(['t','reason','vx','vy','wz']);w.writerows(decisions)
+        w=csv.writer(f); w.writerow(['t','reason','vx','vy','wz','cells','ride_y','side','now','scene','n_raised','rx','ry','ry_max']);w.writerows(decisions)
     if latest is not None: Image.fromarray(latest.rgb).save(out/'last_camera.jpg')
-    summary=dict(case=case,result=result,time_s=times[-1],end_pose=robot.pose.tolist(),progress_m=progress,
+    summary=dict(case=case,result=result,longest_zero_s=round(longest_zero,3),pending_site_added=pending_site_start is not None,time_s=times[-1],end_pose=robot.pose.tolist(),progress_m=progress,
                  max_progress_m=max(a[4] for a in telemetry),track_length_m=track.length,entered_sharp_join=bool(entered_sharp),
                  entered_box_area=bool(box_area),passed_boxes=passed_boxes,entered_small_bend=bool(entered),
                  referee=referee.reason,referee_time_s=referee.event_time,contact_detail=referee.event_detail,
@@ -382,6 +462,10 @@ def run(case, gui, hold):
             max_requested_after_one_second=max(abs(v) for r in after_settle for v in r[8:11]),
             displacement_after_one_second_m=float(np.linalg.norm(np.array(window[-1][1:3])-after_settle[0][1:3])))
     (out/'summary.json').write_text(json.dumps(summary,indent=2))
+    if box_steps:
+        audit=dict(steps=box_steps,counts=dict(Counter(s['axis'] for s in box_steps)),
+                   violations=sum(bool(s['issues']) for s in box_steps))
+        (out/'step_audit.json').write_text(json.dumps(audit,indent=2))
     print(json.dumps(summary),flush=True)
     recorder.close()
     if view is not None:

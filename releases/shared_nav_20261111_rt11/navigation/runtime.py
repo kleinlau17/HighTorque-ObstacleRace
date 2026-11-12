@@ -388,6 +388,9 @@ class OnboardNavigation:
         self.scene = 'unknown_depth'
         self.reference_time = None
         self.edge_correction = None
+        self.measured_lane = None
+        self.search_origin = None
+        self.search_side = 1.
         self.inside_lane_start = True
         self.lane = self.support = None
         self.steering_heading = None
@@ -399,8 +402,7 @@ class OnboardNavigation:
         self.tracking_control = self.finished = self.holding_lane = False
         self.last_control_time = self.deadline = None
         self.desired = np.zeros(3)
-        # Last translational request. RT10 never publishes zero once walking:
-        # a missing plan holds this velocity instead of standing still.
+        # Most recent lateral/forward request used by the inherited lane controller.
         self.last_drive = np.zeros(2)
         self.reason = 'initializing'
 
@@ -594,11 +596,19 @@ class OnboardNavigation:
                 self.map_offer = offer
             else:
                 self.pending = self.worker.submit(self._track, *offer)
-        self.crates.observe(frame,attitude,self.local,self.tracked,self.initial_yaw,observation.lane)
+        self.crates.observe(frame,attitude,self.local,self.tracked,self.initial_yaw,observation.lane,image_ok)
         if self.crates.done:
             self.tracking_control=False
             self.box_latched=self.saw_box=False
             self.unconfirmed_sites.clear()
+        if (image_ok and observation.lane_observed and observation.steering_heading is not None and
+                observation.lane_support is not None and self.scene in ('clear','turn_clear','unknown_depth') and
+                (self.scene!='unknown_depth' or self.local.lane_basis in ('paired_edges','edge_with_history'))):
+            near=max(.15,observation.lane_support[0])
+            slope=np.polyval(np.polyder(observation.lane),near)
+            offset=(np.polyval(observation.lane,near)-near*slope)/np.hypot(1.,slope)
+            self.measured_lane=(frame.time,capture_yaw+observation.steering_heading,float(offset))
+            self.search_origin=None
         if self.tracking_control:
             self.lane_time = None
             return self.tracked.observation
@@ -616,15 +626,40 @@ class OnboardNavigation:
         self.missed_previous = not observation.lane_observed
         return observation
 
+    def _recover_lane(self,t):
+        # The tracker can keep an unconfirmed raised pixel for many seconds.
+        # Use this camera's lane independently of that pending map review.
+        lane=self.measured_lane
+        self.lane_turn.pause(t)
+        self.turning_to_lane=False
+        if lane is not None and 0<=t-lane[0]<=.55 and self.scene in ('clear','turn_clear','unknown_depth'):
+            error=(lane[1]-self.yaw+np.pi)%(2*np.pi)-np.pi
+            turn_only=self.scene=='turn_clear' or abs(error)>np.deg2rad(20)
+            self.desired[:]=[0. if turn_only else min(self.speed,.14),
+                             0. if turn_only else np.clip(1.6*lane[2],-.18,.18),
+                             np.clip(2.5*error,-.8,.8)]
+            self.reason='follow_recovered_lane'
+        else:
+            if self.search_origin is None:
+                self.search_origin=self.yaw if lane is None else lane[1]
+                self.search_side=-1. if self.desired[2]<0 else 1.
+            target=self.search_origin+self.search_side*np.deg2rad(23)
+            error=(target-self.yaw+np.pi)%(2*np.pi)-np.pi
+            if abs(error)<np.deg2rad(4):
+                self.search_side*=-1.
+                error=self.search_side*np.deg2rad(46)
+            self.desired[:]=[0.,0.,np.copysign(.70,error)]
+            self.reason='turn_to_recover_lane'
+        self.last_drive=self.desired[:2].copy()
+        return self.adapter.update(self.desired,enabled=True)
+
     def command(self, timestamp, enabled=True, measured_turn_limit=None):
         previous = self.last_control_time
         self.last_control_time = timestamp
         dt = .02 if previous is None else np.clip(timestamp-previous, 0., .10)
         self.deadline = self.last_frame_time+self.lease if self.last_frame_time is not None else timestamp
         fresh_lane = self.lane_time is not None and timestamp<=self.lane_time+self.lease
-        # RT10: every reason below is telemetry. Nothing here zeroes the
-        # request; a missing plan holds the previous translation and the
-        # mission stops only on its 300 s limit or an operator stop.
+        # A pending obstacle classification may still use a current lane observation.
         if not enabled:
             self.reason = 'disabled'
         elif self.last_imu_time is None or not 0<=timestamp-self.last_imu_time<=.15:
@@ -669,6 +704,9 @@ class OnboardNavigation:
             r = self.tracked
             known = any(-.46<b[0]<1.35 and abs(b[1])<.85 for b in r.observation.obstacles)
             if (not known) and r.navigator.gap.phase=='idle':
+                if (enabled and self.unconfirmed_sites and not self.box_latched and not self.finish_latched and
+                        self.reason not in ('stale_imu','stale_camera','unusable_rgb')):
+                    return self._recover_lane(timestamp)
                 self.reason = ('checking_raised_object' if self.unconfirmed_sites
                                else 'waiting_for_box_geometry')
             else:
@@ -680,6 +718,10 @@ class OnboardNavigation:
                 self.reason = r.reason
                 if r.navigator.gap.drive_until is not None:
                     self.deadline = min(self.deadline, r.navigator.gap.drive_until)
+        elif (enabled and not fresh_lane and self.measured_lane is not None and
+                timestamp-self.measured_lane[0]>self.lease and
+                self.reason in ('lost_vision','unknown_depth')):
+            return self._recover_lane(timestamp)
         elif fresh_lane:
             self.deadline = min(self.deadline, self.lane_time+self.lease)
             near, far = self.support
@@ -733,7 +775,7 @@ class OnboardNavigation:
         # turn cannot become an unbounded spin.
         if not fresh_lane and not self.tracking_control:
             self.desired[2] = 0.
-        # Hold translation instead of publishing zero.
+        # Reuse translation only on the ordinary RT10 lane/tracker path.
         if np.any(self.desired[:2]):
             self.last_drive = self.desired[:2].copy()
         elif np.any(self.last_drive):
